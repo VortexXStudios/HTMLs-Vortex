@@ -608,11 +608,27 @@ const COMMENTS = (() => {
 // ===================== RENDER CORE =====================
 let renderer, scene, camera, sun, hemi, ambient;
 const MAT = {};
+const METAL_GRAYS = { '#888': 1, '#999': 1, '#aaa': 1, '#bbb': 1, '#777': 1, '#666': 1, '#555': 1, '#cccccc': 1, '#bbbbbb': 1, '#888888': 1, '#444': 1, '#333': 1, '#3b3f47': 1 };
 function mat(color, opts) {
   const key = color + (opts ? JSON.stringify(opts) : '');
   if (MAT[key]) return MAT[key];
-  const m = new THREE.MeshLambertMaterial(Object.assign({ color: color }, opts || {}));
+  const metal = METAL_GRAYS[color];
+  const m = new THREE.MeshStandardMaterial(Object.assign({ color: color, roughness: metal ? 0.38 : 0.6, metalness: metal ? 0.55 : 0.04 }, opts || {}));
   MAT[key] = m; return m;
+}
+let TEX = {};
+function canvasTex(size, draw, repeat) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = size; const c = cv.getContext('2d'); draw(c, size);
+  const t = new THREE.CanvasTexture(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.encoding = THREE.sRGBEncoding; t.anisotropy = 4;
+  if (repeat) t.repeat.set(repeat, repeat); return t;
+}
+function makeTextures() {
+  const rnd = mulberry32(99);
+  TEX.grass = canvasTex(256, (c, n) => { c.fillStyle = '#d8d8d8'; c.fillRect(0, 0, n, n); for (let i = 0; i < 5000; i++) { const v = 170 + Math.floor(rnd() * 85); c.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')'; c.fillRect(rnd() * n, rnd() * n, 1 + rnd() * 2, 2 + rnd() * 4); } }, 1);
+  TEX.paver = canvasTex(128, (c, n) => { c.fillStyle = '#ffffff'; c.fillRect(0, 0, n, n); const b = n / 4; for (let r = 0; r < 4; r++) for (let k = -1; k < 4; k++) { const x = k * b * 1.0 + (r % 2 ? b / 2 : 0), y = r * b; const v = 215 + Math.floor(rnd() * 40); c.fillStyle = 'rgb(' + v + ',' + v + ',' + (v - 6) + ')'; c.fillRect(x + 2, y + 2, b - 4, b - 4); } c.strokeStyle = 'rgba(0,0,0,.18)'; c.lineWidth = 2; c.strokeRect(1, 1, n - 2, n - 2); });
+  TEX.wall = canvasTex(128, (c, n) => { c.fillStyle = '#ffffff'; c.fillRect(0, 0, n, n); c.fillStyle = '#3b4d66'; for (const x of [16, 80]) { c.fillRect(x, 30, 32, 30); } c.fillStyle = '#ffffff'; for (const x of [16, 80]) { c.fillRect(x + 15, 30, 2, 30); c.fillRect(x, 44, 32, 2); } c.fillStyle = '#6b4a2b'; c.fillRect(54, 74, 20, 54); c.fillStyle = 'rgba(0,0,0,.08)'; for (let y = 0; y < n; y += 8) c.fillRect(0, y, n, 1); });
+  TEX.wall.wrapS = TEX.wall.wrapT = THREE.ClampToEdgeWrapping;
+  TEX.asphalt = canvasTex(128, (c, n) => { c.fillStyle = '#ffffff'; c.fillRect(0, 0, n, n); for (let i = 0; i < 2500; i++) { const v = 200 + Math.floor(rnd() * 55); c.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')'; c.fillRect(rnd() * n, rnd() * n, 1.5, 1.5); } }, 1);
 }
 const GEO = {};
 function box(w, h, d) { const k = 'b' + w + '_' + h + '_' + d; return GEO[k] || (GEO[k] = new THREE.BoxGeometry(w, h, d)); }
@@ -630,31 +646,54 @@ function labelSprite(text, opts) {
   if (opts.bg) { c2.fillStyle = opts.bg; roundRect(c2, 2, 2, cv.width - 4, cv.height - 4, fs * 0.35); c2.fill(); }
   c2.lineWidth = fs * 0.12; c2.strokeStyle = opts.stroke || 'rgba(0,0,0,.8)'; c2.strokeText(text, cv.width / 2, cv.height / 2);
   c2.fillStyle = opts.color || '#fff'; c2.fillText(text, cv.width / 2, cv.height / 2);
-  const tex = new THREE.CanvasTexture(cv); tex.minFilter = THREE.LinearFilter;
+  const tex = new THREE.CanvasTexture(cv); tex.minFilter = THREE.LinearFilter; tex.encoding = THREE.sRGBEncoding;
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false, transparent: true }));
   const sc = opts.scale || 4; sp.scale.set(sc * cv.width / cv.height, sc, 1);
   return sp;
 }
 function roundRect(c, x, y, w, h, r) { c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
 
+let skyDome, skyMat, envRT;
 function initRenderer() {
+  // treat every hex color we pass as sRGB (proper color pipeline)
+  const _ss = THREE.Color.prototype.setStyle;
+  THREE.Color.prototype.setStyle = function (st) { _ss.call(this, st); return this.convertSRGBToLinear ? this.convertSRGBToLinear() : this; };
   renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   $('#view').appendChild(renderer.domElement);
   scene = new THREE.Scene();
-  scene.background = new THREE.Color('#9fd3ff');
-  scene.fog = new THREE.Fog('#9fd3ff', 600, 1600);
-  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 3000);
-  hemi = new THREE.HemisphereLight('#dfefff', '#4a6a30', 0.65); scene.add(hemi);
-  ambient = new THREE.AmbientLight('#ffffff', 0.15); scene.add(ambient);
-  sun = new THREE.DirectionalLight('#fff3dd', 0.85);
-  sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024);
-  const sc = sun.shadow.camera; sc.left = -130; sc.right = 130; sc.top = 130; sc.bottom = -130; sc.near = 10; sc.far = 600;
-  sun.shadow.bias = -0.0008;
+  scene.fog = new THREE.Fog('#bcdcf5', 600, 1600);
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 4000);
+  hemi = new THREE.HemisphereLight('#d6ecff', '#5a6b3a', 0.55); scene.add(hemi);
+  ambient = new THREE.AmbientLight('#ffffff', 0.05); scene.add(ambient);
+  sun = new THREE.DirectionalLight('#fff1d6', 1.7);
+  sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+  const sc = sun.shadow.camera; sc.left = -140; sc.right = 140; sc.top = 140; sc.bottom = -140; sc.near = 10; sc.far = 700;
+  sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.04;
   scene.add(sun); scene.add(sun.target);
+  // sky dome
+  skyMat = new THREE.ShaderMaterial({
+    uniforms: { top: { value: new THREE.Color('#3d8ee8') }, mid: { value: new THREE.Color('#bfe0ff') }, bot: { value: new THREE.Color('#e8f2ff') } },
+    vertexShader: 'varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform vec3 top; uniform vec3 mid; uniform vec3 bot; varying vec3 vP; void main(){ float h = vP.y; vec3 c = h > 0.0 ? mix(mid, top, pow(clamp(h,0.0,1.0),0.55)) : mix(mid, bot, clamp(-h*4.0,0.0,1.0)); gl_FragColor = vec4(pow(c, vec3(1.0/2.2)), 1.0); }',
+    side: THREE.BackSide, depthWrite: false, fog: false,
+  });
+  skyDome = new THREE.Mesh(new THREE.SphereGeometry(3000, 32, 16), skyMat); skyDome.renderOrder = -1; skyDome.frustumCulled = false; scene.add(skyDome);
+  // environment reflections from a simple gradient sky
+  try {
+    const envScene = new THREE.Scene(); const eg = new THREE.SphereGeometry(10, 24, 12); const ec = [];
+    const top = new THREE.Color('#6aa8f0'), hor = new THREE.Color('#e6f0ff'), gr = new THREE.Color('#5d6e45');
+    const p = eg.attributes.position; for (let i = 0; i < p.count; i++) { const y = p.getY(i) / 10; const col = y > 0 ? hor.clone().lerp(top, y) : hor.clone().lerp(gr, Math.min(1, -y * 3)); ec.push(col.r, col.g, col.b); }
+    eg.setAttribute('color', new THREE.Float32BufferAttribute(ec, 3));
+    envScene.add(new THREE.Mesh(eg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    const pm = new THREE.PMREMGenerator(renderer); envRT = pm.fromScene(envScene, 0.04); scene.environment = envRT.texture; pm.dispose();
+  } catch (e) { console.warn('env map failed', e); }
+  makeTextures();
   window.addEventListener('resize', () => { renderer.setSize(window.innerWidth, window.innerHeight); camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); });
 }
 
@@ -753,17 +792,18 @@ function buildWorldMeshes(rng, parkName) {
     const x = pos.getX(i), z = pos.getZ(i);
     const n = Math.sin(x * 0.013) * Math.cos(z * 0.011) * 0.5 + Math.sin(x * 0.041 + z * 0.03) * 0.25 + rng() * 0.15;
     const edge = Math.max(Math.abs(x), Math.abs(z)) > 880 ? 0.15 : 0;
-    cols[i * 3] = 0.33 + n * 0.06 + edge; cols[i * 3 + 1] = 0.56 + n * 0.08 + edge * 0.6; cols[i * 3 + 2] = 0.24 + n * 0.04;
+    cols[i * 3] = Math.pow(0.36 + n * 0.06 + edge, 2.2); cols[i * 3 + 1] = Math.pow(0.6 + n * 0.08 + edge * 0.6, 2.2); cols[i * 3 + 2] = Math.pow(0.27 + n * 0.04, 2.2);
     if (Math.max(Math.abs(x), Math.abs(z)) > 960) pos.setY(i, 20 + rng() * 30);
   }
   g.setAttribute('color', new THREE.BufferAttribute(cols, 3)); g.computeVertexNormals();
-  const ground = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  const gt = TEX.grass.clone(); gt.needsUpdate = true; gt.repeat.set(220, 220);
+  const ground = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, map: gt }));
   ground.position.y = -0.05; ground.receiveShadow = true; worldGroup.add(ground);
   // lake
   const lake = mesh(new THREE.CircleGeometry(110, 40), new THREE.MeshLambertMaterial({ color: '#3d8fd1' }), 330, 0.02, -260); lake.rotation.x = -Math.PI / 2; worldGroup.add(lake);
   const lake2 = mesh(new THREE.CircleGeometry(70, 32), new THREE.MeshLambertMaterial({ color: '#3d8fd1' }), 420, 0.02, -190); lake2.rotation.x = -Math.PI / 2; worldGroup.add(lake2);
   // roads
-  const roadMat = new THREE.MeshLambertMaterial({ color: '#3b3f47' }), lineMat = new THREE.MeshLambertMaterial({ color: '#f2d14b' });
+  const roadMat = new THREE.MeshLambertMaterial({ color: '#3f434b', map: TEX.asphalt }), lineMat = new THREE.MeshLambertMaterial({ color: '#f2d14b' });
   for (const e of world.edges) {
     const a = world.nodes[e.a], b = world.nodes[e.b];
     const len = Math.hypot(b.x - a.x, b.z - a.z), w = e.kind === 'hwy' ? 12 : e.kind === 'road' ? 9 : 8;
@@ -772,7 +812,7 @@ function buildWorldMeshes(rng, parkName) {
   }
   // houses (instanced)
   const H = world.houses.length;
-  const hb = IM(box(8, 5, 8), new THREE.MeshLambertMaterial({ color: '#ffffff' }), H);
+  const hb = IM(box(8, 5, 8), new THREE.MeshLambertMaterial({ color: '#ffffff', map: TEX.wall }), H);
   const hr = IM(cone(6.4, 3.4, 4), new THREE.MeshLambertMaterial({ color: '#ffffff' }), H);
   const d = new THREE.Object3D(), c = new THREE.Color();
   world.houses.forEach((h, i) => {
@@ -801,13 +841,15 @@ function buildWorldMeshes(rng, parkName) {
     trees.push({ x, z, s: 0.8 + rng() * 0.9, pine: rng() < 0.45 });
   }
   const tt = IM(cyl(0.6, 0.8, 4, 6), mat('#6b4a2b'), trees.length);
-  const tf = IM(new THREE.IcosahedronGeometry(4, 0), new THREE.MeshLambertMaterial({ color: '#ffffff' }), trees.length);
+  const tf = IM(new THREE.IcosahedronGeometry(4, 1), new THREE.MeshStandardMaterial({ color: '#ffffff', flatShading: true, roughness: 0.9 }), trees.length);
+  const tf2 = IM(new THREE.IcosahedronGeometry(2.8, 1), new THREE.MeshStandardMaterial({ color: '#ffffff', flatShading: true, roughness: 0.9 }), trees.length);
   trees.forEach((t, i) => {
     d.rotation.set(0, t.x, 0); d.position.set(t.x, 2 * t.s, t.z); d.scale.set(t.s, t.s, t.s); d.updateMatrix(); tt.setMatrixAt(i, d.matrix);
     d.position.set(t.x, (t.pine ? 7 : 6) * t.s, t.z); d.scale.set(t.s * (t.pine ? 0.8 : 1.1), t.s * (t.pine ? 1.8 : 1), t.s * (t.pine ? 0.8 : 1.1)); d.updateMatrix(); tf.setMatrixAt(i, d.matrix);
     tf.setColorAt(i, c.set(t.pine ? '#2f6b3a' : ['#4f8f3a', '#5c9c40', '#3f7f35', '#6aa84a'][i % 4]));
+    d.position.set(t.x + 1.2 * t.s, (t.pine ? 10.5 : 8.6) * t.s, t.z - 0.8 * t.s); d.scale.set(t.s * (t.pine ? 0.7 : 1), t.s * (t.pine ? 1.4 : 1), t.s * (t.pine ? 0.7 : 1)); d.updateMatrix(); tf2.setMatrixAt(i, d.matrix); tf2.setColorAt(i, c.set(t.pine ? '#3a7a45' : ['#5e9e45', '#6aab4a', '#4f8f40', '#7ab85a'][i % 4]));
   });
-  worldGroup.add(tt); worldGroup.add(tf);
+  worldGroup.add(tt); worldGroup.add(tf); worldGroup.add(tf2);
   // distant hills
   for (let i = 0; i < 26; i++) { const a = i / 26 * Math.PI * 2, r = 1150 + rng() * 120; const h = mesh(cone(160 + rng() * 120, 120 + rng() * 140, 6), '#5b7d63', Math.cos(a) * r, 40, Math.sin(a) * r); worldGroup.add(h); }
   // parking lot
@@ -826,9 +868,6 @@ const NIGHT_LAMPS = [];
 let BULB_MAT;
 function bulbs(group, n, radius, y, size) {
   for (let i = 0; i < n; i++) { const a = i / n * Math.PI * 2; const b = new THREE.Mesh(sph(size || 0.18, 6), BULB_MAT); b.position.set(Math.cos(a) * radius, y, Math.sin(a) * radius); group.add(b); }
-}
-function figure(color) { // small seated rider
-  const g = new THREE.Group(); g.add(mesh(box(0.45, 0.6, 0.35), color, 0, 0.3, 0)); g.add(mesh(sph(0.17, 6), pick(SKINS), 0, 0.75, 0)); return g;
 }
 function platform(r, h, c) { const m = mesh(cyl(r, r + 0.2, h, 24), c, 0, h / 2, 0); m.receiveShadow = true; return m; }
 function aFrame(g, x, h, depth, color) { // two legs meeting at top
@@ -852,7 +891,7 @@ const RIDE_BUILD = {
       h.add(mesh(box(0.45, 0.7, 1.4), i % 3 ? '#ffffff' : '#c49a6c', 0, 0, 0));
       h.add(mesh(box(0.35, 0.7, 0.4), i % 3 ? '#ffffff' : '#c49a6c', 0, 0.45, 0.6));
       for (const lx of [-0.15, 0.15]) for (const lz of [-0.5, 0.5]) h.add(mesh(box(0.12, 0.6, 0.12), '#ddd', lx, -0.55, lz));
-      spin.add(h); horses.push(h);
+      spin.add(h); horses.push(h); seat(h, 0, 0.36, -0.1, 0);
     }
     return { root: g, update(dt, rf, sp, prog, rr) { spin.rotation.y += dt * 0.8 * rf * sp; const t = performance.now() / 1000; horses.forEach((h, i) => h.position.y = 1.6 + Math.sin(t * 2.6 + i) * 0.45 * rf); } };
   },
@@ -866,7 +905,7 @@ const RIDE_BUILD = {
       const a = i / 6 * Math.PI * 2, c = new THREE.Group(); c.position.set(Math.cos(a) * 3.3, 0.3, Math.sin(a) * 3.3);
       c.add(mesh(cyl(1.25, 0.85, 1.15, 14), i % 2 ? r.c1 : r.c2, 0, 0.6, 0)); c.add(mesh(cyl(1.05, 1.05, 0.1, 14), '#ffffff', 0, 1.18, 0));
       c.add(mesh(cyl(0.12, 0.12, 0.6, 6), '#bbbbbb', 0, 1.3, 0)); c.add(mesh(cyl(0.45, 0.45, 0.08, 10), '#888888', 0, 1.6, 0));
-      table.add(c); cups.push({ c, s: 1 + Math.random() * 2.5, d: Math.random() < 0.5 ? 1 : -1 });
+      table.add(c); cups.push({ c, s: 1 + Math.random() * 2.5, d: Math.random() < 0.5 ? 1 : -1 }); seat(c, -0.5, 0.42, 0, Math.PI / 2); seat(c, 0.5, 0.42, 0, -Math.PI / 2);
     }
     return { root: g, update(dt, rf, sp) { table.rotation.y += dt * 0.5 * rf * sp; cups.forEach(o => o.c.rotation.y += dt * o.s * o.d * rf * sp * 1.4); } };
   },
@@ -881,7 +920,8 @@ const RIDE_BUILD = {
     const gonds = [];
     for (let i = 0; i < 12; i++) {
       const a = i / 12 * Math.PI * 2, gp = new THREE.Group(); gp.position.set(Math.cos(a) * R, Math.sin(a) * R, 0); wheel.add(gp);
-      const cab = new THREE.Group(); cab.add(mesh(box(1.4, 0.15, 1.8), '#666', 0, 0, 0)); cab.add(mesh(box(1.4, 1.2, 1.8), [r.c1, r.c2, '#ffcc33', '#5aa8ff'][i % 4], 0, -1.1, 0)); cab.add(mesh(cone(1.2, 0.5, 4), '#eee', 0, -0.1, 0));
+      const cab = new THREE.Group(); const cc = [r.c1, r.c2, '#ffcc33', '#5aa8ff'][i % 4]; cab.add(mesh(box(1.5, 0.12, 1.9), '#666', 0, -1.72, 0)); cab.add(mesh(box(1.5, 0.55, 1.9), cc, 0, -1.42, 0)); for (const sx of [-0.7, 0.7]) for (const sz of [-0.9, 0.9]) cab.add(mesh(box(0.06, 1.25, 0.06), '#ddd', sx, -0.75, sz)); cab.add(mesh(cone(1.25, 0.5, 4), cc, 0, -0.05, 0)); cab.add(mesh(box(0.05, 0.3, 0.05), '#999', 0, 0.15, 0));
+      seat(cab, 0, -1.64, -0.45, 0); seat(cab, 0, -1.64, 0.45, Math.PI);
       gp.add(cab); gonds.push(gp);
     }
     return { root: g, update(dt, rf, sp) { wheel.rotation.z += dt * 0.22 * rf * sp; gonds.forEach(gp => gp.rotation.z = -wheel.rotation.z); } };
@@ -894,7 +934,7 @@ const RIDE_BUILD = {
       const a = i / 4 * Math.PI * 2, arm = new THREE.Group(); arm.rotation.y = -a; spin.add(arm);
       arm.add(mesh(box(2.6, 0.15, 0.15), '#999', 1.3, 1.4, 0));
       const h = new THREE.Group(); h.position.set(2.8, 1.0, 0); arm.add(h);
-      h.add(mesh(sph(0.6, 8), i % 2 ? r.c1 : r.c2, 0, 0, 0)); h.add(mesh(box(1.4, 0.2, 0.2), '#555', -0.9, 0.1, 0)); const rot = mesh(box(2.4, 0.06, 0.2), '#333', 0, 0.75, 0); h.add(rot);
+      h.add(mesh(sph(0.6, 8), i % 2 ? r.c1 : r.c2, 0, 0, 0)); seat(h, 0, 0.3, 0, Math.PI / 2, { scale: 0.62 }); h.add(mesh(box(1.4, 0.2, 0.2), '#555', -0.9, 0.1, 0)); const rot = mesh(box(2.4, 0.06, 0.2), '#333', 0, 0.75, 0); h.add(rot);
       hel.push({ h, rot, ph: i });
     }
     return { root: g, update(dt, rf, sp) { spin.rotation.y += dt * 0.9 * rf * sp; const t = performance.now() / 1000; hel.forEach(o => { o.h.position.y = 1.0 + (Math.sin(t * 1.5 + o.ph) * 0.5 + 0.5) * 1.2 * rf; o.rot.rotation.y += dt * 8 * rf; }); } };
@@ -910,11 +950,11 @@ const RIDE_BUILD = {
     for (let i = 0; i < 16; i++) {
       const a = i / 16 * Math.PI * 2, piv = new THREE.Group(); piv.position.set(Math.cos(a) * 4.6, -0.4, Math.sin(a) * 4.6); piv.rotation.y = -a; top.add(piv);
       const arm = new THREE.Group(); piv.add(arm); arm.add(mesh(box(0.05, 6.2, 0.05), '#aaa', 0, -3.1, 0)); const seat = mesh(box(0.7, 0.15, 0.7), i % 2 ? r.c1 : '#ffffff', 0, -6.2, 0); arm.add(seat);
-      const f = figure(pick(SHIRTS)); f.position.y = -6.1; f.visible = false; arm.add(f);
-      arms.push({ arm, f });
+      seat(arm, 0, -6.12, 0, Math.PI / 2);
+      arms.push({ arm });
     }
     let ang = 0;
-    return { root: g, update(dt, rf, sp, prog, rr) { top.rotation.y += dt * 1.1 * rf * sp; ang = lerp(ang, rf * 0.95 * Math.min(sp, 1.35), dt * 1.2); arms.forEach(o => { o.arm.rotation.z = ang; o.f.visible = rr && rr.riders.length > 0; }); if (yoyo) { const t = performance.now() / 1000; tilt.rotation.x = Math.sin(t * 0.7) * 0.32 * rf; tilt.rotation.z = Math.cos(t * 0.7) * 0.32 * rf; } } };
+    return { root: g, update(dt, rf, sp, prog, rr) { top.rotation.y += dt * 1.1 * rf * sp; ang = lerp(ang, rf * 0.95 * Math.min(sp, 1.35), dt * 1.2); arms.forEach(o => { o.arm.rotation.z = ang; }); if (yoyo) { const t = performance.now() / 1000; tilt.rotation.x = Math.sin(t * 0.7) * 0.32 * rf; tilt.rotation.z = Math.cos(t * 0.7) * 0.32 * rf; } } };
   },
   paratrooper(r) {
     const g = new THREE.Group(); g.add(platform(7.4, 0.4, '#d8d0c0'));
@@ -926,7 +966,7 @@ const RIDE_BUILD = {
     for (let i = 0; i < 10; i++) {
       const a = i / 10 * Math.PI * 2, arm = mesh(box(6, 0.25, 0.25), '#bbb', Math.cos(a) * 3, 0, Math.sin(a) * 3); arm.rotation.y = -a; spin.add(arm);
       const hang = new THREE.Group(); hang.position.set(Math.cos(a) * 6.2, 0, Math.sin(a) * 6.2); spin.add(hang);
-      hang.add(mesh(cone(1.3, 0.8, 8), i % 2 ? r.c1 : r.c2, 0, 0.3, 0)); hang.add(mesh(box(0.06, 1.8, 0.06), '#aaa', 0, -0.8, 0)); hang.add(mesh(box(1.0, 0.5, 0.7), '#444', 0, -1.8, 0));
+      hang.add(mesh(cone(1.3, 0.8, 8), i % 2 ? r.c1 : r.c2, 0, 0.3, 0)); hang.add(mesh(box(0.06, 1.8, 0.06), '#aaa', 0, -0.8, 0)); hang.add(mesh(box(1.0, 0.5, 0.7), '#444', 0, -1.8, 0)); seat(hang, -0.22, -1.56, 0, 0); seat(hang, 0.22, -1.56, 0, 0);
       seats.push(hang);
     }
     let tl = 0;
@@ -944,9 +984,9 @@ const RIDE_BUILD = {
     ship.add(mesh(box(4.6, 0.6, 15.4), r.c2, 0, 1.3, 0));
     const bow = mesh(cone(2.2, 3.5, 4), r.c1, 0, 0.2, 9); bow.rotation.x = Math.PI / 2; bow.rotation.y = Math.PI / 4; ship.add(bow);
     ship.add(mesh(cyl(0.15, 0.15, 7, 6), '#5a3a1a', 0, 4, 0)); const sail = mesh(box(0.1, 4, 4.4), '#f4f0e0', 0, 4.6, 0); ship.add(sail);
-    for (let i = 0; i < 6; i++) { const f = figure(pick(SHIRTS)); f.position.set((i % 2 ? -1 : 1), 0.6, -5 + i * 2); ship.add(f); }
+    for (let i = 0; i < 14; i++) { const sx = i % 2 ? -1.1 : 1.1; seat(ship, sx, 1.55, -6 + Math.floor(i / 2) * 2, sx < 0 ? Math.PI / 2 : -Math.PI / 2); }
     let ph = 0, amp = 0;
-    return { root: g, update(dt, rf, sp, prog, rr) { ph += dt * 1.25; amp = lerp(amp, rf * clamp(0.62 * sp, 0.2, 1.25), dt * 0.35); piv.rotation.x = Math.sin(ph) * amp; ship.children.forEach(c => { if (c.children && c.children.length === 2 && c.position.y > 0.5) c.visible = !!(rr && rr.riders.length); }); } };
+    return { root: g, update(dt, rf, sp, prog, rr) { ph += dt * 1.25; amp = lerp(amp, rf * clamp(0.62 * sp, 0.2, 1.25), dt * 0.35); piv.rotation.x = Math.sin(ph) * amp; } };
   },
   droptower(r) {
     const g = new THREE.Group(); g.add(platform(3.6, 0.5, '#bbb'));
@@ -955,7 +995,7 @@ const RIDE_BUILD = {
     for (let y = 4; y < 40; y += 3) { const b = new THREE.Mesh(sph(0.2, 6), BULB_MAT); b.position.set(0.95, y, 0.95); g.add(b); }
     const car = new THREE.Group(); g.add(car);
     car.add(mesh(cyl(2.4, 2.4, 0.5, 12), r.c1, 0, 0, 0));
-    for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2; const s = mesh(box(0.8, 1.2, 0.4), '#333', Math.cos(a) * 2.2, 0.6, Math.sin(a) * 2.2); s.rotation.y = -a + Math.PI / 2; car.add(s); }
+    for (let i = 0; i < 12; i++) { const a = i / 12 * Math.PI * 2; const s = mesh(box(0.7, 1.2, 0.3), '#333', Math.cos(a) * 2.2, 0.6, Math.sin(a) * 2.2); s.rotation.y = -a + Math.PI / 2; car.add(s); seat(car, Math.cos(a) * 2.5, 0.05, Math.sin(a) * 2.5, Math.atan2(Math.cos(a), Math.sin(a))); }
     car.position.y = 1.2; let y = 1.2;
     return {
       root: g, update(dt, rf, sp, prog, rr) {
@@ -972,28 +1012,27 @@ const RIDE_BUILD = {
     };
   },
   bumper(r) {
-    const g = new THREE.Group(); g.add(mesh(box(15, 0.3, 11), '#3a3f4c', 0, 0.15, 0));
-    for (const [x, z, w, d] of [[0, 5.5, 15, 0.3], [0, -5.5, 15, 0.3], [7.5, 0, 0.3, 11], [-7.5, 0, 0.3, 11]]) g.add(mesh(box(w, 0.9, d), '#ffcc33', x, 0.6, z));
-    for (const x of [-7.3, 7.3]) for (const z of [-5.3, 5.3]) g.add(mesh(cyl(0.2, 0.2, 5, 6), '#888', x, 2.5, z));
-    g.add(mesh(box(15.2, 0.4, 11.2), r.c1, 0, 5.1, 0)); g.add(mesh(box(14.8, 0.1, 10.8), '#222', 0, 4.9, 0));
-    bulbs(g, 20, 7.3, 5.4, 0.16);
+    const g = new THREE.Group(); g.add(mesh(box(12, 0.3, 9), '#3a3f4c', 0, 0.15, 0));
+    for (const [x, z, w, d] of [[0, 4.5, 12, 0.3], [0, -4.5, 12, 0.3], [6, 0, 0.3, 9], [-6, 0, 0.3, 9]]) g.add(mesh(box(w, 0.9, d), '#ffcc33', x, 0.6, z));
+    for (const x of [-5.8, 5.8]) for (const z of [-4.3, 4.3]) g.add(mesh(cyl(0.2, 0.2, 5, 6), '#888', x, 2.5, z));
+    g.add(mesh(box(12.2, 0.4, 9.2), r.c1, 0, 5.1, 0)); g.add(mesh(box(11.8, 0.1, 8.8), '#222', 0, 4.9, 0));
+    for (let i = 0; i < 12; i++) { const b = new THREE.Mesh(sph(0.16, 6), BULB_MAT); b.position.set(-5.5 + i, 5.4, 4.6); g.add(b); }
     const cars = [];
     for (let i = 0; i < 8; i++) {
       const c = new THREE.Group(); c.add(mesh(box(1.4, 0.6, 2), [r.c1, r.c2, '#ffcc33', '#5aa8ff'][i % 4], 0, 0.6, 0)); c.add(mesh(box(1.6, 0.3, 2.2), '#222', 0, 0.35, 0)); c.add(mesh(cyl(0.05, 0.05, 4.2, 4), '#999', 0, 2.8, -0.7));
-      const f = figure(pick(SHIRTS)); f.position.y = 0.6; c.add(f);
-      c.position.set(-5 + (i % 4) * 3.3, 0.1, -2.5 + Math.floor(i / 4) * 5); g.add(c);
-      cars.push({ c, vx: 0, vz: 0, f });
+      seat(c, 0, 0.5, -0.15, 0);
+      c.position.set(-4 + (i % 4) * 2.7, 0.1, -2 + Math.floor(i / 4) * 4); g.add(c);
+      cars.push({ c, vx: 0, vz: 0 });
     }
     return {
       root: g, update(dt, rf, sp, prog, rr) {
         const on = rf > 0.5;
         cars.forEach(o => {
-          o.f.visible = !!(rr && rr.riders.length);
           if (on) { if (Math.random() < dt * 0.8) { const a = Math.random() * Math.PI * 2; o.vx = Math.cos(a) * 3.5 * sp; o.vz = Math.sin(a) * 3.5 * sp; } }
           else { o.vx *= 0.9; o.vz *= 0.9; }
           o.c.position.x += o.vx * dt; o.c.position.z += o.vz * dt;
-          if (Math.abs(o.c.position.x) > 6.4) { o.vx = -o.vx; o.c.position.x = Math.sign(o.c.position.x) * 6.4; }
-          if (Math.abs(o.c.position.z) > 4.4) { o.vz = -o.vz; o.c.position.z = Math.sign(o.c.position.z) * 4.4; }
+          if (Math.abs(o.c.position.x) > 5.0) { o.vx = -o.vx; o.c.position.x = Math.sign(o.c.position.x) * 5.0; }
+          if (Math.abs(o.c.position.z) > 3.4) { o.vz = -o.vz; o.c.position.z = Math.sign(o.c.position.z) * 3.4; }
           if (Math.abs(o.vx) + Math.abs(o.vz) > 0.2) o.c.rotation.y = Math.atan2(o.vx, o.vz);
         });
       }
@@ -1009,7 +1048,7 @@ const RIDE_BUILD = {
     for (let i = 0; i < 12; i++) {
       const piv = new THREE.Group(); boom.add(piv);
       const cage = new THREE.Group(); piv.add(cage);
-      cage.add(mesh(box(1.8, 1.8, 1.8), i % 2 ? r.c1 : r.c2, 0, 0, 0)); cage.add(mesh(box(1.9, 0.3, 1.9), '#ffffff', 0, 0, 0));
+      const cm = new THREE.MeshStandardMaterial({ color: i % 2 ? r.c1 : r.c2, transparent: true, opacity: 0.4, roughness: 0.3, depthWrite: false }); cage.add(new THREE.Mesh(box(1.8, 1.8, 1.8), cm)); cage.add(mesh(box(1.9, 0.3, 1.9), i % 2 ? r.c1 : r.c2, 0, -0.85, 0)); cage.add(mesh(box(1.9, 0.12, 1.9), '#ffffff', 0, 0.85, 0)); seat(cage, -0.4, -0.7, 0, Math.PI / 2); seat(cage, 0.4, -0.7, 0, Math.PI / 2);
       cages.push({ piv, cage, u: i / 12, spin: 0, sv: (Math.random() - 0.5) * 2 });
     }
     const oval = u => { const a = u * Math.PI * 2; return { z: Math.cos(a) * 7.5, y: Math.sin(a) * 1.6 }; };
@@ -1026,7 +1065,7 @@ const RIDE_BUILD = {
     g.add(mesh(box(2, 4, 2), r.c2, 0, 2, 0));
     const tilt = new THREE.Group(); tilt.position.y = 4; g.add(tilt); const spin = new THREE.Group(); tilt.add(spin);
     spin.add(mesh(cyl(6.6, 6.6, 0.5, 24), r.c1, 0, 0, 0)); spin.add(mesh(cyl(1.4, 1.4, 1.2, 12), r.c2, 0, 0.6, 0));
-    for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2; const c = mesh(box(0.9, 2.2, 0.9), i % 2 ? r.c2 : '#ffffff', Math.cos(a) * 6, 1.3, Math.sin(a) * 6); c.rotation.y = -a; spin.add(c); }
+    for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2; const c = mesh(box(0.9, 2.2, 0.2), i % 2 ? r.c2 : '#ffffff', Math.cos(a) * 6.3, 1.3, Math.sin(a) * 6.3); c.rotation.y = -a + Math.PI / 2; spin.add(c); seat(spin, Math.cos(a) * 5.9, 0.9, Math.sin(a) * 5.9, Math.atan2(-Math.cos(a), -Math.sin(a)), { stand: true }); }
     bulbs(spin, 24, 6.7, 0.3, 0.16);
     let tl = 0;
     return { root: g, update(dt, rf, sp) { spin.rotation.y += dt * 1.6 * rf * sp; tl = lerp(tl, rf * 1.15 * Math.min(sp, 1.2), dt * 0.4); tilt.rotation.x = tl; } };
@@ -1040,7 +1079,7 @@ const RIDE_BUILD = {
     for (let i = 0; i < 4; i++) { const a = i / 4 * Math.PI * 2 + Math.PI / 4; for (const x of [-1.2, 1.2]) { const s = mesh(box(0.25, 0.25, 10), '#777', x, C + Math.sin(a) * 5, Math.cos(a) * 5); s.rotation.x = -a; g.add(s); } }
     const train = new THREE.Group(); train.position.y = C; g.add(train);
     const cars = [];
-    for (let i = 0; i < 8; i++) { const c = new THREE.Group(); c.add(mesh(box(2.2, 1.2, 1.6), i === 0 ? r.c2 : r.c1, 0, 0.6, 0)); train.add(c); cars.push(c); }
+    for (let i = 0; i < 8; i++) { const c = new THREE.Group(); c.add(mesh(box(2.2, 0.8, 1.6), i === 0 ? r.c2 : r.c1, 0, 0.4, 0)); c.add(mesh(box(2.2, 1.0, 0.15), i === 0 ? r.c2 : r.c1, 0, 0.9, -0.75)); seat(c, -0.5, 0.55, 0, 0); seat(c, 0.5, 0.55, 0, 0); train.add(c); cars.push(c); }
     let th = 0;
     return {
       root: g, update(dt, rf, sp, prog, rr) {
@@ -1062,7 +1101,7 @@ const RIDE_BUILD = {
     for (const s of [-1, 1]) {
       const p = new THREE.Group(); p.position.set(s * 1.1, H, 0); g.add(p);
       p.add(mesh(box(0.8, 17, 0.9), r.c1, 0, 0, 0));
-      const gon = new THREE.Group(); gon.position.y = -8.4; p.add(gon); gon.add(mesh(box(1.6, 2.4, 4.2), s < 0 ? r.c2 : '#ffffff', 0, 0, 0));
+      const gon = new THREE.Group(); gon.position.y = -8.4; p.add(gon); const gm = new THREE.MeshStandardMaterial({ color: s < 0 ? r.c2 : '#ffffff', transparent: true, opacity: 0.35, roughness: 0.3, depthWrite: false }); gon.add(new THREE.Mesh(box(1.6, 2.4, 4.2), gm)); gon.add(mesh(box(1.7, 0.25, 4.3), s < 0 ? r.c2 : '#ffffff', 0, -1.15, 0)); gon.add(mesh(box(1.7, 0.2, 4.3), s < 0 ? r.c2 : '#ffffff', 0, 1.15, 0)); for (let k = 0; k < 4; k++) seat(gon, 0, -0.95, -1.4 + k * 0.95, s > 0 ? Math.PI / 2 : -Math.PI / 2);
       p.add(mesh(box(1.4, 1.6, 1.6), '#333', 0, 8.2, 0));
       for (let y = -7; y <= 7; y += 2) { const b = new THREE.Mesh(sph(0.18, 6), BULB_MAT); b.position.set(s * 0.45, y, 0.5); p.add(b); }
       arms.push({ p, gon, s });
@@ -1093,7 +1132,7 @@ const RIDE_BUILD = {
     g.add(mesh(box(3, 2.5, 2), '#222', 0, 1.6, -7.6));
     g.add(mesh(cyl(1.5, 1.5, 2.6, 12), r.c2, 0, 1.3, 0));
     const spin = new THREE.Group(); g.add(spin); const cars = [];
-    for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2, c = new THREE.Group(); c.add(mesh(box(2.4, 1.1, 1.8), i % 2 ? r.c2 : r.c1, 0, 0, 0)); c.add(mesh(box(2.4, 0.9, 0.3), '#ffffff', 0, 0.8, -0.8)); spin.add(c); cars.push({ c, a }); }
+    for (let i = 0; i < 16; i++) { const a = i / 16 * Math.PI * 2, c = new THREE.Group(); c.add(mesh(box(2.4, 0.7, 1.8), i % 2 ? r.c2 : r.c1, 0, -0.2, 0)); c.add(mesh(box(2.4, 1.2, 0.3), '#ffffff', 0, 0.5, -0.8)); seat(c, -0.5, 0.15, 0.1, 0); seat(c, 0.5, 0.15, 0.1, 0); spin.add(c); cars.push({ c, a }); }
     let ang = 0;
     return {
       root: g, update(dt, rf, sp, prog, rr) {
@@ -1109,7 +1148,7 @@ const RIDE_BUILD = {
     for (let i = 0; i < 3; i++) {
       const a = i / 3 * Math.PI * 2, arm = mesh(box(4.4, 0.4, 0.4), r.c1, Math.cos(a) * 2.2, 0, Math.sin(a) * 2.2); arm.rotation.y = -a; main.add(arm);
       const sub = new THREE.Group(); sub.position.set(Math.cos(a) * 4.4, 0, Math.sin(a) * 4.4); main.add(sub); subs.push(sub);
-      for (let j = 0; j < 4; j++) { const b = j / 4 * Math.PI * 2; const sa = mesh(box(2.4, 0.2, 0.2), '#999', Math.cos(b) * 1.2, -0.4, Math.sin(b) * 1.2); sa.rotation.y = -b; sub.add(sa); const car = mesh(sizzler ? sph(0.9, 10) : box(1.3, 1, 1.5), j % 2 ? r.c2 : r.c1, Math.cos(b) * 2.4, -2.4, Math.sin(b) * 2.4); sub.add(car); sub.add(mesh(box(0.12, 2, 0.12), '#aaa', Math.cos(b) * 2.4, -1.4, Math.sin(b) * 2.4)); }
+      for (let j = 0; j < 4; j++) { const b = j / 4 * Math.PI * 2; const sa = mesh(box(2.4, 0.2, 0.2), '#999', Math.cos(b) * 1.2, -0.4, Math.sin(b) * 1.2); sa.rotation.y = -b; sub.add(sa); const car = mesh(sizzler ? sph(0.9, 10) : box(1.3, 0.7, 1.5), j % 2 ? r.c2 : r.c1, Math.cos(b) * 2.4, -2.55, Math.sin(b) * 2.4); if (sizzler) car.scale.y = 0.6; sub.add(car); seat(sub, Math.cos(b) * 2.4, -2.45, Math.sin(b) * 2.4, Math.atan2(-Math.cos(b), -Math.sin(b))); sub.add(mesh(box(0.12, 2, 0.12), '#aaa', Math.cos(b) * 2.4, -1.4, Math.sin(b) * 2.4)); }
     }
     bulbs(main, 9, 0.9, 0.5, 0.12);
     return { root: g, update(dt, rf, sp) { main.rotation.y += dt * 1.0 * rf * sp; subs.forEach(s => s.rotation.y -= dt * (sizzler ? 2.6 : 2.0) * rf * sp); } };
@@ -1118,7 +1157,7 @@ const RIDE_BUILD = {
     const g = new THREE.Group(); g.add(platform(7.4, 0.5, '#c0b8a8'));
     g.add(mesh(cyl(1.2, 1.2, 2, 12), r.c2, 0, 1, 0)); bulbs(g, 20, 7.5, 0.6, 0.18);
     const spin = new THREE.Group(); g.add(spin); const cars = [];
-    for (let i = 0; i < 7; i++) { const a = i / 7 * Math.PI * 2, c = new THREE.Group(); const shell = mesh(cyl(1.4, 1.2, 1.4, 12, 1), i % 2 ? r.c1 : r.c2, 0, 0.7, 0); c.add(shell); c.add(mesh(box(2.6, 1.4, 0.3), '#ffffff', 0, 1.4, -1.0)); spin.add(c); cars.push({ c, a, s: 0, v: 0 }); }
+    for (let i = 0; i < 7; i++) { const a = i / 7 * Math.PI * 2, c = new THREE.Group(); const shell = mesh(cyl(1.4, 1.2, 0.8, 12), i % 2 ? r.c1 : r.c2, 0, 0.4, 0); c.add(shell); c.add(mesh(box(2.6, 1.6, 0.3), i % 2 ? r.c1 : r.c2, 0, 1.0, -1.0)); seat(c, -0.45, 0.75, -0.2, 0); seat(c, 0.45, 0.75, -0.2, 0); spin.add(c); cars.push({ c, a, s: 0, v: 0 }); }
     let ang = 0;
     return {
       root: g, update(dt, rf, sp) {
@@ -1199,12 +1238,12 @@ function buildCoasterMesh(r) {
       inner.position.y = -2.2; car.add(mesh(box(0.4, 2.0, 0.4), '#555', 0, -1.0, 0));
       const seatG = new THREE.Group(); inner.add(seatG);
       seatG.add(mesh(box(2.4, 0.3, 2.0), i === 0 ? r.c2 : r.c1, 0, 0, 0));
-      for (let k = 0; k < 4; k++) { const f = new THREE.Group(); f.add(mesh(box(0.45, 0.3, 1.2), pick(SHIRTS), 0, 0, 0)); f.add(mesh(sph(0.17, 6), pick(SKINS), 0, 0, 0.75)); f.position.set(-0.9 + k * 0.6, 0.3, 0); f.visible = false; seatG.add(f); }
+      for (let k = 0; k < 4; k++) seat(seatG, -0.9 + k * 0.6, 0.18, -0.5, 0, { lie: true });
       car.userData.seat = seatG;
     } else {
       inner.add(mesh(box(1.9, 0.9, 2.2), i === 0 ? r.c2 : r.c1, 0, 0.45, 0));
       if (i === 0) inner.add(mesh(box(1.9, 0.6, 0.6), r.c2, 0, 0.9, 1.1));
-      for (let k = 0; k < 2; k++) { const f = figure(pick(SHIRTS)); f.position.set(k ? 0.45 : -0.45, 0.6, 0); f.visible = false; inner.add(f); }
+      for (let k = 0; k < 2; k++) seat(inner, k ? 0.45 : -0.45, 0.35, -0.3, 0);
     }
     cars.push(car);
   }
@@ -1240,8 +1279,6 @@ function coasterAnimate(r, dt, spd) {
       if (C.flyA >= 0) { if (ls > C.flyA && ls < C.flyB) f = Math.min(1, (ls - C.flyA) / 6, (C.flyB - ls) / 6); }
       car.userData.seat.rotation.z = f * Math.PI; car.userData.fly = f;
     }
-    const showRiders = r.riders.length > 0;
-    car.traverse(o => { if (o.isGroup && o !== car && o.children.length === 2 && o.parent && o.parent !== car) o.visible = showRiders; });
   });
 }
 function coasterPOV(r) {
@@ -1263,18 +1300,16 @@ function buildStandMesh(s) {
     for (let i = -1; i <= 1; i++) g.add(mesh(box(2.4, 2, 0.1), '#9fd3ff', i * 3.2, 2.8, 3.05));
     g.add(mesh(box(1.6, 3, 0.15), '#5a3a1a', 0, 1.5, 3.05));
     for (const x of [-3.5, 3.5]) { g.add(mesh(cyl(0.9, 0.9, 0.15, 10), '#ffffff', x, 1.0, 4.6)); g.add(mesh(cyl(0.1, 0.1, 1, 5), '#888', x, 0.5, 4.6)); const um = mesh(cone(1.5, 0.6, 8), '#ff4d5e', x, 2.6, 4.6); g.add(um); g.add(mesh(cyl(0.05, 0.05, 2, 4), '#888', x, 1.6, 4.6)); }
+    g.add(mesh(box(0.7, 1.1, 0.5), '#5a3a1a', 1.6, 0.55, 4.4)); g.add(mesh(box(0.8, 0.06, 0.6), '#c9a46a', 1.6, 1.12, 4.4));
+    for (let i = 0; i < 6; i++) { const b = new THREE.Mesh(sph(0.18, 6), BULB_MAT); b.position.set(-4.5 + i * 1.8, 5.0, 3.15); g.add(b); }
     const lb = labelSprite(s.name || 'DINER', { color: '#ffcc33', scale: 2.2 }); lb.position.set(0, 7, 2); g.add(lb); g.userData.label = lb;
   } else if (s.type === 'sweets') {
-    g.add(mesh(box(2.2, 1.2, 1.4), c1, 0, 1.0, -0.2)); for (const x of [-0.9, 0.9]) { const w = mesh(cyl(0.35, 0.35, 0.15, 10), '#333', x, 0.35, 0.55); w.rotation.x = Math.PI / 2; g.add(w); }
+    g.add(mesh(box(2.2, 1.2, 1.4), c1, 0, 1.0, -0.2)); for (const x of [-1.15, 1.15]) { const w = mesh(cyl(0.38, 0.38, 0.12, 12), '#333', x, 0.38, -0.2); w.rotation.z = Math.PI / 2; g.add(w); } g.add(mesh(box(2.0, 0.08, 1.2), '#ffffff', 0, 1.64, -0.2)); for (let i = 0; i < 3; i++) g.add(mesh(sph(0.2, 8), ['#ff7ad9', '#ffffff', '#ffcc33'][i], -0.6 + i * 0.6, 1.85, -0.2));
     g.add(mesh(cyl(0.05, 0.05, 2.6, 4), '#bbb', 0, 2.3, -0.2)); g.add(mesh(cone(1.8, 0.8, 10), '#ffffff', 0, 3.6, -0.2)); g.add(mesh(cone(1.82, 0.4, 10), c1, 0, 3.4, -0.2));
     const lb = labelSprite(s.name || 'SWEETS', { color: '#ffffff', scale: 1.2 }); lb.position.set(0, 4.6, 0); g.add(lb); g.userData.label = lb;
   } else {
-    const b = mesh(box(3.2, 2.6, 2.4), '#f0ece0', 0, 1.3, -0.6); b.castShadow = true; g.add(b);
-    g.add(mesh(box(3.3, 0.9, 0.5), c1, 0, 1.0, 0.7));
-    for (let i = 0; i < 4; i++) { const st = mesh(box(0.85, 0.12, 1.4), i % 2 ? '#ffffff' : c1, -1.2 + i * 0.8, 2.85, 0.9); st.rotation.x = 0.35; g.add(st); }
-    if (s.type === 'drinks') { g.add(mesh(cyl(0.6, 0.45, 1.3, 10), '#5aa8ff', 0, 3.3, -0.8)); g.add(mesh(cyl(0.05, 0.05, 1, 4), '#ff4d5e', 0.2, 4.2, -0.8)); }
-    else { g.add(mesh(box(1.4, 0.8, 0.2), '#ffcc33', 0, 3.2, -1.4)); }
-    const lb = labelSprite(s.name || s.def.name, { color: '#ffffff', scale: 1.1 }); lb.position.set(0, 4.3, 0); g.add(lb); g.userData.label = lb;
+    g.add(buildKiosk(s, c1));
+    const lb = labelSprite(s.name || s.def.name, { color: '#ffffff', scale: 1.1 }); lb.position.set(0, 4.4, 0); g.add(lb); g.userData.label = lb;
   }
   // fire fx
   const fire = new THREE.Group(); fire.visible = false; g.add(fire);
@@ -1296,6 +1331,217 @@ function buildFacMesh(type, extra) {
     case 'fountain': { g.add(mesh(cyl(3.4, 3.6, 0.9, 20), '#c9c2b2', 0, 0.45, 0)); g.add(mesh(cyl(3.0, 3.0, 0.2, 20), '#5ab0ff', 0, 0.85, 0)); g.add(mesh(cyl(0.4, 0.6, 2, 8), '#c9c2b2', 0, 1.8, 0)); const w = mesh(cone(1.2, 2.4, 10), new THREE.MeshLambertMaterial({ color: '#bfe4ff', transparent: true, opacity: 0.7 }), 0, 3.6, 0); w.rotation.x = Math.PI; g.add(w); g.userData.spray = w; break; }
   }
   return g;
+}
+
+// ===================== PROPS, BOOTHS, FIGURES =====================
+let GLASS, BTN_R, BTN_G, BTN_Y, SPARK_MAT;
+function initPropMats() {
+  GLASS = new THREE.MeshStandardMaterial({ color: '#cfeaff', transparent: true, opacity: 0.28, roughness: 0.05, metalness: 0.2, depthWrite: false });
+  BTN_R = new THREE.MeshStandardMaterial({ color: '#ff3040', emissive: '#ff2030', emissiveIntensity: 1.2 });
+  BTN_G = new THREE.MeshStandardMaterial({ color: '#30ff60', emissive: '#20ff50', emissiveIntensity: 1.2 });
+  BTN_Y = new THREE.MeshStandardMaterial({ color: '#ffd030', emissive: '#ffc020', emissiveIntensity: 1.2 });
+  SPARK_MAT = new THREE.MeshBasicMaterial({ color: '#ffe680' });
+}
+// operator control booth. Console + window face -z, door at +z.
+function buildBooth(color, small) {
+  const g = new THREE.Group();
+  if (small) {
+    g.add(mesh(box(1.0, 1.0, 0.55), color, 0, 0.5, -0.35));
+    const top = mesh(box(1.05, 0.1, 0.65), '#2a2f45', 0, 1.05, -0.35); top.rotation.x = -0.35; g.add(top);
+    [BTN_R, BTN_G, BTN_Y].forEach((m, i) => { const b = new THREE.Mesh(sph(0.06, 6), m); b.position.set(-0.3 + i * 0.3, 1.12, -0.32); g.add(b); });
+    g.add(mesh(box(0.8, 0.06, 0.8), '#9a9488', 0, 0.03, 0.2));
+    return g;
+  }
+  const S = 2.1, H = 2.5, w = 0.1;
+  g.add(mesh(box(S, 0.12, S), '#9a9488', 0, 0.06, 0));
+  g.add(mesh(box(S, 1.0, w), color, 0, 0.5, -S / 2));
+  for (const sx of [-1, 1]) g.add(mesh(box(w, 1.0, S), color, sx * S / 2, 0.5, 0));
+  for (const sx of [-1, 1]) g.add(mesh(box(S * 0.28, H, w), color, sx * (S / 2 - S * 0.14), H / 2, S / 2));
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) g.add(mesh(box(0.1, H, 0.1), '#e8e8e8', sx * S / 2, H / 2, sz * S / 2));
+  const glassF = new THREE.Mesh(box(S, H - 1.0, 0.04), GLASS); glassF.position.set(0, 1.0 + (H - 1.0) / 2, -S / 2); g.add(glassF);
+  for (const sx of [-1, 1]) { const gs = new THREE.Mesh(box(0.04, H - 1.0, S), GLASS); gs.position.set(sx * S / 2, 1.0 + (H - 1.0) / 2, 0); g.add(gs); }
+  const roof = mesh(box(S + 0.5, 0.16, S + 0.5), color, 0, H + 0.08, 0); roof.castShadow = true; g.add(roof);
+  g.add(mesh(box(S + 0.6, 0.1, S + 0.6), '#ffffff', 0, H - 0.02, 0));
+  const con = mesh(box(S * 0.75, 0.12, 0.5), '#2a2f45', 0, 1.05, -S / 2 + 0.32); con.rotation.x = -0.3; g.add(con);
+  [BTN_R, BTN_G, BTN_Y, BTN_G].forEach((m, i) => { const b = new THREE.Mesh(sph(0.055, 6), m); b.position.set(-0.45 + i * 0.3, 1.13, -S / 2 + 0.3); g.add(b); });
+  return g;
+}
+// open-front food kiosk; cashier stands at (0,-0.55) facing +z
+function buildKiosk(s, c1) {
+  const g = new THREE.Group();
+  g.add(mesh(box(3.4, 0.12, 2.8), '#b8b0a0', 0, 0.06, -0.4));
+  g.add(mesh(box(3.4, 2.6, 0.15), '#f2eee4', 0, 1.3, -1.75));
+  g.add(mesh(box(0.15, 2.6, 2.6), '#f2eee4', -1.65, 1.3, -0.45));
+  g.add(mesh(box(0.15, 2.6, 0.7), '#f2eee4', 1.65, 1.3, -1.4));
+  const roof = mesh(box(3.8, 0.18, 3.2), c1, 0, 2.72, -0.35); roof.castShadow = true; g.add(roof);
+  g.add(mesh(box(3.3, 1.05, 0.45), c1, 0, 0.53, 0.75));
+  g.add(mesh(box(3.45, 0.08, 0.6), '#ffffff', 0, 1.08, 0.75));
+  for (let i = 0; i < 4; i++) { const st = mesh(box(0.85, 0.08, 1.2), i % 2 ? '#ffffff' : c1, -1.28 + i * 0.85, 2.95, 1.0); st.rotation.x = 0.4; g.add(st); }
+  g.add(mesh(box(2.2, 0.9, 0.05), '#2a2f45', 0, 1.95, -1.66));
+  for (let i = 0; i < 4; i++) g.add(mesh(box(0.8, 0.08, 0.02), '#ffcc33', -0.5 + (i % 2) * 1.0, 2.2 - Math.floor(i / 2) * 0.3, -1.63));
+  if (s.type === 'drinks') { g.add(mesh(box(0.8, 1.5, 0.6), '#5aa8ff', -1.0, 0.75, -1.3)); g.add(mesh(box(0.6, 0.3, 0.05), '#ffffff', -1.0, 1.2, -0.99)); g.add(mesh(cyl(0.55, 0.42, 1.2, 12), '#5aa8ff', 0, 3.5, -0.6)); g.add(mesh(cyl(0.05, 0.05, 0.9, 4), '#ff4d5e', 0.2, 4.4, -0.6)); }
+  else { g.add(mesh(box(1.2, 0.9, 0.6), '#333', -0.9, 0.45, -1.35)); g.add(mesh(box(1.2, 0.05, 0.6), '#555', -0.9, 0.92, -1.35)); g.add(mesh(box(0.6, 1.2, 0.6), '#d8d8d8', 1.0, 0.6, -1.35)); g.add(mesh(box(1.5, 0.7, 0.2), '#ffcc33', 0, 3.3, -1.6)); }
+  for (let i = 0; i < 3; i++) g.add(mesh(cyl(0.1, 0.1, 0.25, 8), pick(['#ff4d5e', '#ffcc33', '#ffffff', '#5aa8ff']), -1.0 + i * 0.35, 1.25, 0.75));
+  return g;
+}
+// staff center outside the park (east of the gate): breaks + training
+const SC = { x: 122, z: 74 };
+const SC_SEATS = [], SC_CLASS = [];
+function buildStaffCenter() {
+  const g = new THREE.Group(); g.position.set(SC.x, 0, SC.z);
+  g.add(mesh(box(30, 0.1, 26), '#9e9a90', 0, 0.05, 0));
+  const b = mesh(box(12, 5, 9), '#d9dde4', 8, 2.5, -7); b.castShadow = true; g.add(b);
+  g.add(mesh(box(12.6, 0.4, 9.6), '#4a5a78', 8, 5.2, -7));
+  g.add(mesh(box(1.6, 2.6, 0.1), '#4a5a78', 5, 1.3, -2.45));
+  for (const x of [8.5, 11.5]) g.add(mesh(box(1.6, 1.2, 0.1), '#9fd3ff', x, 3, -2.45));
+  const lb = labelSprite('STAFF CENTER', { color: '#ffffff', scale: 1.6, bg: 'rgba(74,90,120,.95)' }); lb.position.set(8, 6.4, -2.4); g.add(lb);
+  g.add(mesh(box(0.9, 1.9, 0.8), '#ff4d5e', 1.5, 0.95, -3.0));
+  // picnic tables (break area)
+  SC_SEATS.length = 0;
+  for (const tz of [-4, 3]) {
+    g.add(mesh(box(3.2, 0.12, 1.2), '#8a5a32', -7, 1.0, tz)); for (const sx of [-1.3, 1.3]) g.add(mesh(box(0.12, 1.0, 1.0), '#6b4a2b', -7 + sx, 0.5, tz));
+    for (const sz of [-0.95, 0.95]) { g.add(mesh(box(3.2, 0.1, 0.35), '#8a5a32', -7, 0.5, tz + sz)); for (let k = 0; k < 2; k++) SC_SEATS.push({ x: SC.x - 7.8 + k * 1.6, z: SC.z + tz + sz, h: sz < 0 ? 0 : Math.PI, taken: null }); }
+    const um = mesh(cone(2.2, 0.8, 8), '#ffcc33', -7, 3.1, tz); g.add(um); g.add(mesh(cyl(0.05, 0.05, 2.6, 4), '#888', -7, 1.8, tz));
+  }
+  // training area: whiteboard + chairs
+  SC_CLASS.length = 0;
+  g.add(mesh(box(4, 2.2, 0.12), '#ffffff', 8, 2.2, 10)); g.add(mesh(box(4.2, 2.4, 0.08), '#555', 8, 2.2, 10.08));
+  for (const x of [6.3, 9.7]) g.add(mesh(box(0.1, 1.2, 0.1), '#555', x, 0.6, 10));
+  g.add(mesh(box(1.4, 0.05, 0.02), '#ff4d5e', 7.2, 2.7, 9.93)); g.add(mesh(box(1.8, 0.05, 0.02), '#2a6bff', 8.4, 2.3, 9.93)); g.add(mesh(box(1.2, 0.05, 0.02), '#2a2f45', 7.8, 1.9, 9.93));
+  for (let k = 0; k < 6; k++) { const cx = 6.6 + (k % 3) * 1.4, cz = 6.6 - Math.floor(k / 3) * 1.6; g.add(mesh(box(0.6, 0.08, 0.6), '#2a6bff', cx, 0.5, cz)); g.add(mesh(box(0.6, 0.6, 0.08), '#2a6bff', cx, 0.8, cz - 0.3)); for (const lx of [-0.25, 0.25]) g.add(mesh(box(0.05, 0.5, 0.05), '#888', cx + lx, 0.25, cz)); SC_CLASS.push({ x: SC.x + cx, z: SC.z + cz, h: 0, taken: null }); }
+  SC.teach = { x: SC.x + 8, z: SC.z + 9.2, h: Math.PI };
+  scene.add(g);
+}
+// route between the gate and the staff center
+function routeToCenter(dest) { const gx = gateX(); return [{ x: tcx(GATE_GX), z: PHALF + 1.5 }, { x: gx + 8, z: 100 }, { x: SC.x - 16, z: 100 }, { x: SC.x - 14, z: SC.z + 6 }, { x: dest.x, z: dest.z }]; }
+function routeFromCenter(from) { const gx = gateX(); return [{ x: SC.x - 14, z: SC.z + 6 }, { x: SC.x - 16, z: 100 }, { x: gx + 8, z: 100 }, { x: tcx(GATE_GX), z: PHALF + 1.5 }, { x: tcx(GATE_GX), z: tcz(GATE_GZ) }]; }
+
+// wet floor signs pool
+let wetSigns = [];
+function initWetSigns() {
+  for (let i = 0; i < 24; i++) {
+    const g = new THREE.Group();
+    for (const s of [-1, 1]) { const p = mesh(box(0.55, 0.85, 0.03), '#ffd400', 0, 0.42, s * 0.14); p.rotation.x = s * 0.3; g.add(p); }
+    g.add(mesh(box(0.3, 0.3, 0.04), '#111', 0, 0.5, 0.27)); g.visible = false; scene.add(g); wetSigns.push(g);
+  }
+}
+function refreshWetSigns() {
+  let n = 0;
+  for (let i = 0; i < NN && n < wetSigns.length; i++) if (wetFloor[i] > 0 && GS.wetSign[i]) { const s = wetSigns[n++]; s.visible = true; s.position.set(tcx(i % GRID) + 1.1, 0.14, tcz((i / GRID) | 0) + 1.1); s.rotation.y = i; }
+  for (; n < wetSigns.length; n++) wetSigns[n].visible = false;
+}
+
+// ---------- riders on rides ----------
+let SEATS = null;
+const HAIRS = ['#2b1a10', '#5a3a1a', '#1a1a1a', '#c9a15a', '#8a4a20', '#d8d0c0', '#3a2a1a', '#b05a2a'];
+const PANTS = ['#2c3e66', '#3b5998', '#1a1a1a', '#c2b28a', '#555b66', '#6b4a2b', '#2f4f3f'];
+function riderFigure(opts) {
+  opts = opts || {};
+  const g = new THREE.Group(), shirt = new THREE.MeshStandardMaterial({ color: '#ff4d5e', roughness: 0.7 });
+  g.add(mesh(box(0.42, 0.5, 0.26), shirt, 0, 0.36, 0));
+  g.add(mesh(sph(0.16, 8), mat(pick(SKINS)), 0, 0.8, 0));
+  const hair = mesh(sph(0.168, 8), mat(pick(HAIRS)), 0, 0.85, -0.03); hair.scale.set(1, 0.7, 1); g.add(hair);
+  const arms = [];
+  for (const sx of [-1, 1]) { const p = new THREE.Group(); p.position.set(sx * 0.27, 0.56, 0); p.add(mesh(box(0.11, 0.42, 0.12), shirt, 0, -0.2, 0)); g.add(p); arms.push(p); }
+  if (opts.stand) g.add(mesh(box(0.34, 0.8, 0.2), mat(pick(PANTS)), 0, -0.3, 0));
+  else g.add(mesh(box(0.36, 0.14, 0.45), mat(pick(PANTS)), 0, 0.07, 0.2));
+  g.userData.shirt = shirt; g.userData.arms = arms; g.visible = false;
+  return g;
+}
+function seat(parent, x, y, z, ry, opts) {
+  const f = riderFigure(opts); f.position.set(x, y, z); f.rotation.y = ry || 0;
+  if (opts && opts.lie) f.rotation.x = -Math.PI / 2;
+  if (opts && opts.scale) f.scale.set(opts.scale, opts.scale, opts.scale);
+  parent.add(f); if (SEATS) SEATS.push(f); return f;
+}
+function updateSeats(r) {
+  const S = r.mesh.seats; if (!S || !S.length) return;
+  const n = r.riders.length ? Math.min(S.length, Math.max(1, Math.round(r.riders.length / r.def.cap * S.length))) : 0;
+  const key = n + ':' + r.stats.cycles + ':' + r.riders.length;
+  if (key !== r.seatKey) {
+    r.seatKey = key;
+    for (let i = 0; i < S.length; i++) { const f = S[i]; f.visible = i < n; if (i < n) { const g = r.riders[i % r.riders.length]; f.userData.shirt.color.set(g.shirt); } }
+  }
+  if (!n) return;
+  const up = r.state === 'running' && !r.stuck && r.def.int >= 3.5, t = performance.now() / 1000;
+  for (let i = 0; i < n; i++) { const a = S[i].userData.arms, raise = up && (i % 3 !== 0) ? 2.7 + Math.sin(t * 3 + i) * 0.25 : (r.stuck ? 0.5 + Math.abs(Math.sin(t * 4 + i)) * 0.6 : 0.12); a[0].rotation.z = -raise; a[1].rotation.z = raise; }
+}
+
+// ---------- articulated staff figure ----------
+const ROLE_LOOK = {
+  operator: { shirt: '#ff4d5e', hat: 'cap', hatC: '#ff4d5e' }, opmanager: { shirt: '#ffffff', hat: null, tie: '#ff4d5e', prop: 'clipboard' },
+  maintenance: { shirt: '#ff9a3c', hat: 'hard', hatC: '#ffd400', prop: 'wrench', vest: '#ffe14a' }, mxmanager: { shirt: '#ffffff', hat: 'hard', hatC: '#ffffff', prop: 'clipboard', tie: '#ff9a3c' },
+  cashier: { shirt: '#5ee08a', hat: 'cap', hatC: '#2a9a5a' }, gate: { shirt: '#35d0c0', hat: 'cap', hatC: '#1d8a80' },
+  parking: { shirt: '#ff9a3c', hat: 'cap', hatC: '#ff9a3c', vest: '#d8ff3a', prop: 'wand' }, supplier: { shirt: '#b08a5a', hat: 'cap', hatC: '#6b4a2b' },
+  janitor: { shirt: '#5aa8ff', hat: 'cap', hatC: '#2a5a9a', prop: 'broom' }, security: { shirt: '#1d2a48', hat: 'cap', hatC: '#111111', prop: 'radio', pants: '#111' },
+  trainer: { shirt: '#c08aff', hat: null, prop: 'clipboard' }, planner: { shirt: '#f4f0e0', hat: null, prop: 'clipboard', tie: '#35d0c0' },
+};
+function makeStaffFigure(role) {
+  const L = ROLE_LOOK[role] || { shirt: '#888' }, root = new THREE.Group();
+  const shirt = mat(L.shirt), pants = mat(L.pants || pick(['#2c3e66', '#1a1a1a', '#3a3a44'])), skin = mat(pick(SKINS));
+  const body = new THREE.Group(); root.add(body);
+  const legs = [];
+  for (const sx of [-1, 1]) { const p = new THREE.Group(); p.position.set(sx * 0.13, 0.92, 0); p.add(mesh(box(0.18, 0.86, 0.2), pants, 0, -0.43, 0)); p.add(mesh(box(0.2, 0.1, 0.3), '#222', 0, -0.88, 0.05)); body.add(p); legs.push(p); }
+  const torso = mesh(box(0.52, 0.66, 0.3), shirt, 0, 1.26, 0); body.add(torso);
+  if (L.vest) body.add(mesh(box(0.54, 0.5, 0.32), L.vest, 0, 1.3, 0));
+  if (L.tie) body.add(mesh(box(0.08, 0.38, 0.02), L.tie, 0, 1.32, 0.16));
+  const arms = [];
+  for (const sx of [-1, 1]) { const p = new THREE.Group(); p.position.set(sx * 0.33, 1.54, 0); p.add(mesh(box(0.13, 0.58, 0.15), shirt, 0, -0.29, 0)); p.add(mesh(sph(0.075, 6), skin, 0, -0.62, 0)); body.add(p); arms.push(p); }
+  const head = new THREE.Group(); head.position.y = 1.83; body.add(head);
+  head.add(mesh(sph(0.21, 10), skin, 0, 0, 0));
+  for (const sx of [-1, 1]) head.add(mesh(sph(0.03, 4), '#111', sx * 0.07, 0.03, 0.19));
+  const hair = mesh(sph(0.215, 10), mat(pick(HAIRS)), 0, 0.06, -0.03); hair.scale.set(1, 0.75, 1); head.add(hair);
+  if (L.hat === 'cap') { head.add(mesh(cyl(0.22, 0.22, 0.12, 12), L.hatC, 0, 0.14, 0)); head.add(mesh(box(0.3, 0.03, 0.18), L.hatC, 0, 0.1, 0.2)); }
+  if (L.hat === 'hard') { const h = mesh(sph(0.24, 10), L.hatC, 0, 0.08, 0); h.scale.set(1, 0.75, 1.05); head.add(h); head.add(mesh(cyl(0.29, 0.29, 0.03, 12), L.hatC, 0, 0.04, 0)); }
+  // props in right hand
+  const hand = new THREE.Group(); hand.position.set(0, -0.62, 0); arms[1].add(hand);
+  if (L.prop === 'clipboard') { const cb = mesh(box(0.28, 0.36, 0.03), '#8a5a32', 0, 0.05, 0.12); cb.rotation.x = -0.6; const lh = new THREE.Group(); lh.position.set(0, -0.62, 0); arms[0].add(lh); lh.add(cb); lh.add(mesh(box(0.22, 0.26, 0.01), '#ffffff', 0, 0.06, 0.135)); }
+  if (L.prop === 'broom') { const br = new THREE.Group(); br.add(mesh(cyl(0.025, 0.025, 1.5, 5), '#b08a5a', 0, -0.2, 0.25)); br.add(mesh(box(0.45, 0.12, 0.12), '#333', 0, -0.95, 0.42)); br.rotation.x = 0.35; hand.add(br); }
+  if (L.prop === 'wrench') hand.add(mesh(box(0.05, 0.32, 0.05), '#aaa', 0, -0.1, 0.06));
+  if (L.prop === 'radio') hand.add(mesh(box(0.08, 0.18, 0.05), '#111', 0, 0.02, 0.06));
+  if (L.prop === 'wand') { const w = mesh(cyl(0.035, 0.035, 0.5, 6), '#ff6a00', 0, -0.2, 0.05); w.material = new THREE.MeshStandardMaterial({ color: '#ff6a00', emissive: '#ff5000', emissiveIntensity: 0.8 }); hand.add(w); }
+  // extras
+  const extras = {};
+  if (role === 'maintenance') { const tb = new THREE.Group(); tb.add(mesh(box(0.55, 0.3, 0.28), '#c1272d', 0, 0.15, 0)); tb.add(mesh(box(0.3, 0.06, 0.06), '#333', 0, 0.34, 0)); tb.position.set(0.55, 0, 0.35); tb.visible = false; root.add(tb); extras.toolbox = tb;
+    const sp = new THREE.Group(); for (let i = 0; i < 6; i++) sp.add(new THREE.Mesh(sph(0.04, 4), SPARK_MAT)); sp.visible = false; root.add(sp); extras.sparks = sp; }
+  root.traverse(o => { if (o.isMesh) o.castShadow = o.geometry === GEO['b0.52_0.66_0.3'] || false; });
+  torso.castShadow = true;
+  scene.add(root);
+  return { root, body, legs, arms, head, extras };
+}
+function animateFigure(F, anim, t, ph) {
+  const s = Math.sin(t * 8 + ph), L = F.legs, A = F.arms;
+  let by = 0, lx = 0, rx = 0, alx = 0, arx = 0, alz = 0.06, arz = -0.06, hx = 0;
+  switch (anim) {
+    case 'walk': lx = s * 0.55; rx = -s * 0.55; alx = -s * 0.45; arx = s * 0.45; by = Math.abs(s) * 0.04; break;
+    case 'run': { const r = Math.sin(t * 13 + ph); lx = r * 0.9; rx = -r * 0.9; alx = -r * 0.9 - 0.3; arx = r * 0.9 - 0.3; by = Math.abs(r) * 0.08; break; }
+    case 'console': alx = -0.95; arx = -1.05 + Math.sin(t * 5 + ph) * 0.12; hx = 0.15; break;
+    case 'sweep': { const w = Math.sin(t * 5 + ph); alx = -0.7 + w * 0.3; arx = -0.5 + w * 0.45; alz = 0.25; arz = -0.1 - w * 0.25; hx = 0.25; break; }
+    case 'hammer': by = -0.42; lx = -1.45; rx = 0.25; alx = -0.9; arx = -2.1 + Math.abs(Math.sin(t * 9 + ph)) * 1.2; hx = 0.45; break;
+    case 'clipboard': alx = -1.15; arx = -0.95 + Math.sin(t * 14 + ph) * 0.06; hx = 0.35; break;
+    case 'inspect': alx = -1.15; arx = -0.4; hx = -0.35 + Math.sin(t * 1.5 + ph) * 0.15; break;
+    case 'wave': arz = -0.1; arx = -0.3; alz = 0.06; { const w = Math.sin(t * 7 + ph); F.arms[1].rotation.z = 2.4 + w * 0.4; } break;
+    case 'carry': alx = -1.35 + Math.sin(t * 4) * 0.25; arx = -1.35 + Math.sin(t * 4) * 0.25; by = Math.abs(Math.sin(t * 4)) * -0.1; hx = 0.2; break;
+    case 'sit': by = -0.42; lx = -1.5; rx = -1.5; alx = -0.5; arx = -0.5; break;
+    case 'sitlisten': by = -0.42; lx = -1.5; rx = -1.5; alx = -0.3; arx = -0.6; hx = Math.sin(t * 0.8 + ph) * 0.1; break;
+    case 'point': arx = -2.0 + Math.sin(t * 2) * 0.3; alx = -0.6; hx = Math.sin(t * 1.2) * 0.2; break;
+    case 'talk': arx = -0.8 + Math.sin(t * 6 + ph) * 0.4; alx = -0.6 + Math.sin(t * 5 + ph) * 0.3; break;
+    case 'stop': arx = -1.5; alx = 0; break;
+    default: alx = Math.sin(t * 1.5 + ph) * 0.04; arx = -alx;
+  }
+  F.body.position.y = by; L[0].rotation.x = lx; L[1].rotation.x = rx; A[0].rotation.x = alx; A[1].rotation.x = arx; A[0].rotation.z = alz;
+  if (anim !== 'wave') A[1].rotation.z = arz;
+  F.head.rotation.x = hx;
+  const ex = F.extras;
+  if (ex.toolbox) ex.toolbox.visible = anim === 'hammer' || anim === 'inspect';
+  if (ex.sparks) { ex.sparks.visible = anim === 'hammer' && Math.sin(t * 9 + ph) > 0.6; if (ex.sparks.visible) ex.sparks.children.forEach(c => c.position.set((Math.random() - 0.5) * 0.5, 0.3 + Math.random() * 0.5, 0.7 + (Math.random() - 0.5) * 0.3)); }
+}
+function makeCart() {
+  const g = new THREE.Group();
+  g.add(mesh(box(0.9, 0.12, 1.3), '#777', 0, 0.45, 0)); for (const sx of [-0.4, 0.4]) for (const sz of [-0.5, 0.5]) { const w = mesh(cyl(0.14, 0.14, 0.08, 8), '#111', sx, 0.14, sz); w.rotation.z = Math.PI / 2; g.add(w); }
+  g.add(mesh(box(0.05, 0.9, 0.05), '#777', 0.4, 0.9, -0.62)); g.add(mesh(box(0.05, 0.9, 0.05), '#777', -0.4, 0.9, -0.62)); g.add(mesh(box(0.85, 0.05, 0.05), '#777', 0, 1.35, -0.62));
+  for (let i = 0; i < 4; i++) g.add(mesh(box(0.4, 0.35, 0.4), '#c9a46a', (i % 2 - 0.5) * 0.42, 0.7 + Math.floor(i / 2) * 0.36, (i % 2 ? 0.2 : -0.15)));
+  scene.add(g); return g;
 }
 
 // ===================== PARK GRID =====================
@@ -1362,8 +1608,9 @@ function canPlace(def, gx, gz, rot, needsEntrance) {
 // ---------- park static meshes ----------
 function buildParkStatic() {
   parkGroup = new THREE.Group(); scene.add(parkGroup);
-  const ground = mesh(box(GRID * TILE, 0.1, GRID * TILE), '#62a64c', 0, 0.02, 0); ground.receiveShadow = true; parkGroup.add(ground);
-  pathMesh = IM(box(TILE * 0.98, 0.14, TILE * 0.98), new THREE.MeshLambertMaterial({ color: '#ffffff' }), NN);
+  const pgt = TEX.grass.clone(); pgt.needsUpdate = true; pgt.repeat.set(24, 24);
+  const ground = mesh(box(GRID * TILE, 0.1, GRID * TILE), new THREE.MeshStandardMaterial({ color: '#6db352', map: pgt, roughness: 0.95 }), 0, 0.02, 0); ground.receiveShadow = true; parkGroup.add(ground);
+  pathMesh = IM(box(TILE, 0.14, TILE), new THREE.MeshStandardMaterial({ color: '#ffffff', map: TEX.paver, roughness: 0.85 }), NN);
   pathMesh.receiveShadow = true; parkGroup.add(pathMesh);
   const c = new THREE.Color('#d8cba8'); for (let i = 0; i < NN; i++) pathMesh.setColorAt(i, c);
   litterMesh = IM(box(0.5, 0.06, 0.4), new THREE.MeshLambertMaterial({ color: '#ffffff' }), 900);
@@ -1384,7 +1631,8 @@ function buildParkStatic() {
   for (const s of [-1, 1]) { const t = mesh(box(2.6, 11, 2.6), '#ff4d5e', s * 7.4, 5.5, 0); t.castShadow = true; gateGroup.add(t); gateGroup.add(mesh(cone(2.2, 3, 4), '#ffcc33', s * 7.4, 12.5, 0)); }
   gateGroup.add(mesh(box(17.4, 2.2, 1.4), '#ffcc33', 0, 9.6, 0));
   for (let i = 0; i < 12; i++) { const b = new THREE.Mesh(sph(0.22, 6), BULB_MAT); b.position.set(-7.4 + i * 1.35, 10.9, 0.75); gateGroup.add(b); }
-  for (let i = -1; i <= 1; i++) { const bth = new THREE.Group(); bth.position.set(i * 5, 0, 4); bth.add(mesh(box(1.8, 2.6, 1.6), '#f0ece0', 0, 1.3, 0)); bth.add(mesh(box(2.2, 0.3, 2.0), '#35d0c0', 0, 2.75, 0)); gateGroup.add(bth); }
+  for (let i = -1; i <= 1; i++) { const bth = buildBooth('#35d0c0'); bth.position.set(i * 5, 0, 4); bth.rotation.y = Math.PI; gateGroup.add(bth); const tk = labelSprite('TICKETS', { color: '#ffffff', scale: 0.8, bg: 'rgba(53,208,192,.95)' }); tk.position.set(i * 5, 3.2, 4.6); gateGroup.add(tk); }
+  buildStaffCenter(); initWetSigns();
   // ghost
   ghost = new THREE.Mesh(box(1, 1, 1), new THREE.MeshBasicMaterial({ color: '#5ee08a', transparent: true, opacity: 0.35, depthWrite: false })); ghost.visible = false; scene.add(ghost);
   ghostArrow = new THREE.Mesh(cone(1.2, 2.4, 4), new THREE.MeshBasicMaterial({ color: '#ffcc33' })); ghostArrow.rotation.x = Math.PI / 2; ghostArrow.visible = false; scene.add(ghostArrow);
@@ -1476,21 +1724,74 @@ function makeRide(type, gx, gz, rot, saved) {
   B.set(r.id, r); rides.push(r); markOcc(r, r.id);
   invalidateFlows(); return r;
 }
+// convert a building-local point into world space
+function l2w(b, lx, lz) { const a = b.rot * Math.PI / 2, cx = tcx(b.gx) + (b.W - 1) * TILE / 2, cz = tcz(b.gz) + (b.H - 1) * TILE / 2; return { x: cx + lx * Math.cos(a) + lz * Math.sin(a), z: cz - lx * Math.sin(a) + lz * Math.cos(a) }; }
+const BOOTH_POS = { ferris: [6.6, 2.5], bumper: [7.0, 4.9], zipper: [5.0, 9.0], ringoffire: [5.0, 9.0], carousel: [4.5, 4.5], teacups: [4.4, 4.4] };
+function rideLayout(r) {
+  const Wl = r.def.w * TILE, Hl = r.def.h * TILE, xe = (Math.floor(r.def.w / 2) - (r.def.w - 1) / 2) * TILE;
+  const small = r.def.w <= 2 || r.def.h <= 2 && r.type !== 'ferris';
+  let bx, bz, by = 0, bry;
+  if (r.def.coaster && r.co) {
+    const C = r.co.C, a = cpAt(C, 0), b = cpAt(C, C.stationEnd), L = Math.hypot(b.x - a.x, b.z - a.z) || 1, dx = (b.x - a.x) / L, dz = (b.z - a.z) / L;
+    const px = dz, pz = -dx, mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
+    bx = mx + px * 2.7 - dx * (L / 2 - 1.8); bz = mz + pz * 2.7 - dz * (L / 2 - 1.8); by = 0.8; bry = Math.atan2(px, pz);
+    r.lay = { check: { lx: mx + px * 1.4, lz: mz + pz * 1.4 } };
+  } else {
+    const p = BOOTH_POS[r.type] || [Wl / 2 - (small ? 0.8 : 1.7), Hl / 2 - (small ? 0.8 : 1.7)];
+    bx = p[0]; bz = p[1]; bry = Math.atan2(bx, bz);
+    r.lay = { check: { lx: xe * 0.4, lz: Hl / 2 - 2.6 } };
+  }
+  const ux = Math.sin(bry), uz = Math.cos(bry); // booth +z (door side) direction
+  r.lay.booth = { lx: bx, lz: bz, ly: by, ry: bry, small };
+  r.lay.xe = xe; r.lay.Wl = Wl; r.lay.Hl = Hl;
+  // world-space routes
+  const W = (lx, lz) => l2w(r, lx, lz);
+  const gap = W(xe, Hl / 2 - 0.6), door = W(bx + ux * 1.5, bz + uz * 1.5), post = W(bx + ux * 0.25, bz + uz * 0.25);
+  r.post = { x: post.x, z: post.z, y: by, h: bry + Math.PI + r.rot * Math.PI / 2, route: [gap, door, post] };
+  const ck = W(r.lay.check.lx, r.lay.check.lz); r.checkPts = [door, ck, door, post];
+  const ins = 1.3, cs = [[-1, 1], [-1, -1], [1, -1], [1, 1]].map(([sx, sz]) => W(sx * (Wl / 2 - ins), sz * (Hl / 2 - ins)));
+  r.inspectPts = [gap].concat(cs).concat([gap]);
+  r.repairPt = W(0, Hl / 2 - 2.8); r.gapPt = gap;
+}
+function addRideSurrounds(r) {
+  const L = r.lay, g = r.mesh.root, Wl = L.Wl, Hl = L.Hl;
+  const pad = mesh(box(Wl - 0.2, 0.08, Hl - 0.2), '#cbc4b4', 0, 0.05, 0); pad.receiveShadow = true; g.add(pad);
+  // fence with a gap at the entrance
+  const segs = [[-Wl / 2, -Hl / 2, Wl / 2, -Hl / 2], [-Wl / 2, -Hl / 2, -Wl / 2, Hl / 2], [Wl / 2, -Hl / 2, Wl / 2, Hl / 2], [-Wl / 2, Hl / 2, L.xe - 1.4, Hl / 2], [L.xe + 1.4, Hl / 2, Wl / 2, Hl / 2]];
+  const ins = 0.25, posts = [];
+  for (const [x0, z0, x1, z1] of segs) {
+    const len = Math.hypot(x1 - x0, z1 - z0); if (len < 0.5) continue;
+    const ax = x0 + Math.sign(-x0) * ins * (x0 === x1 ? 1 : 0), az = z0 + Math.sign(-z0) * ins * (z0 === z1 ? 1 : 0), bx = x1 + Math.sign(-x1) * ins * (x0 === x1 ? 1 : 0), bz = z1 + Math.sign(-z1) * ins * (z0 === z1 ? 1 : 0);
+    for (const yy of [0.55, 1.0]) { const rl = mesh(box(1, 0.07, 0.07), '#4a4f5c', (ax + bx) / 2, yy, (az + bz) / 2); rl.scale.x = len; rl.rotation.y = -Math.atan2(bz - az, bx - ax); g.add(rl); }
+    const n = Math.max(1, Math.round(len / 2)); for (let i = 0; i <= n; i++) posts.push([lerp(ax, bx, i / n), lerp(az, bz, i / n)]);
+  }
+  const pm = IM(box(0.1, 1.05, 0.1), mat('#4a4f5c'), posts.length), d = new THREE.Object3D();
+  posts.forEach((p, i) => { d.position.set(p[0], 0.52, p[1]); d.updateMatrix(); pm.setMatrixAt(i, d.matrix); }); g.add(pm);
+  // operator booth
+  const B = L.booth, bo = buildBooth(r.c2 === '#ffffff' ? r.c1 : r.c2, B.small); bo.position.set(B.lx, B.ly, B.lz); bo.rotation.y = B.ry; g.add(bo);
+}
 function buildRideMesh(r) {
   if (r.mesh) parkGroup.remove(r.mesh.root);
   const savedS = r.co ? r.co.s : null;
+  SEATS = [];
   r.mesh = r.def.coaster ? buildCoasterMesh(r) : RIDE_BUILD[r.type](r);
+  r.mesh.seats = SEATS; SEATS = null; r.seatKey = '';
+  if (!r.def.coaster) { const S = r.mesh.seats; for (let i = S.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [S[i], S[j]] = [S[j], S[i]]; } }
   if (savedS !== null && r.co) r.co.s = savedS;
+  rideLayout(r); addRideSurrounds(r);
   placeMeshAt(r, r.mesh.root);
-  r.mesh.root.traverse(o => { if (o.isMesh && o.material !== BULB_MAT && o.geometry) { if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere(); const bs = o.geometry.boundingSphere; o.castShadow = !!bs && bs.radius * Math.max(o.scale.x, o.scale.y, o.scale.z) > 0.9; } });
-  // entrance sign + queue rail
-  const e = r.ent, sg = new THREE.Group(); sg.position.set(tcx(e.gx) - tcx(r.gx) - (r.W - 1) * TILE / 2, 0, tcz(e.gz) - tcz(r.gz) - (r.H - 1) * TILE / 2);
-  // rotate back into local space
-  const a = -r.rot * Math.PI / 2, lx = sg.position.x * Math.cos(a) + sg.position.z * Math.sin(a), lz = -sg.position.x * Math.sin(a) + sg.position.z * Math.cos(a);
-  sg.position.set(lx, 0, lz - TILE * 0.35);
+  r.mesh.root.traverse(o => { if (o.isMesh && o.material !== BULB_MAT && o.geometry && !o.isInstancedMesh) { if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere(); const bs = o.geometry.boundingSphere; o.castShadow = !!bs && bs.radius * Math.max(o.scale.x, o.scale.y, o.scale.z) > 0.9 && !o.material.transparent; } });
+  // entrance sign
+  const sg = new THREE.Group(); sg.position.set(r.lay.xe, 0, r.lay.Hl / 2 + TILE * 0.15);
   sg.add(mesh(box(0.2, 3.2, 0.2), '#555', -1.6, 1.6, 0)); sg.add(mesh(box(0.2, 3.2, 0.2), '#555', 1.6, 1.6, 0)); sg.add(mesh(box(3.6, 0.9, 0.2), r.c1, 0, 3.3, 0));
   const lb = labelSprite(r.name, { color: '#ffffff', scale: 1.4 }); lb.position.set(0, 4.6, 0); sg.add(lb);
   r.mesh.root.add(sg); r.sign = lb; r.signGroup = sg;
+}
+const STAND_POST = { snack: { p: [0, -0.6], route: [[2.3, 1.7], [2.3, -0.4], [0.9, -0.45]] }, drinks: { p: [0, -0.6], route: [[2.3, 1.7], [2.3, -0.4], [0.9, -0.45]] }, sweets: { p: [0, -1.35], route: [[1.8, 1.4], [1.8, -1.35]] }, diner: { p: [1.6, 3.85], route: [[2.4, 5.4]] } };
+function standLayout(s) {
+  const sp = STAND_POST[s.type], W = (lx, lz) => l2w(s, lx, lz), post = W(sp.p[0], sp.p[1]);
+  s.post = { x: post.x, z: post.z, y: 0, h: s.rot * Math.PI / 2, route: sp.route.map(q => W(q[0], q[1])).concat([post]) };
+  s.sidePt = W(2.4, 0.4);
 }
 function makeStand(type, gx, gz, rot, saved) {
   const def = STAND_DEFS[type]; const { W, H } = footprint(def, rot);
@@ -1504,16 +1805,16 @@ function makeStand(type, gx, gz, rot, saved) {
   s.ent = entranceOf(gx, gz, W, H, rot); s.front = frontDir(rot);
   s.queue = []; s.cashier = null; s.serveT = 0; s.fire = 0; s.fireCalled = false; s.eating = [];
   if (inGrid(s.ent.gx, s.ent.gz) && !tiles[ti(s.ent.gx, s.ent.gz)]) tiles[ti(s.ent.gx, s.ent.gz)] = 1;
-  s.mesh = buildStandMesh(s); placeMeshAt(s, s.mesh); s.mesh.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  s.mesh = buildStandMesh(s); placeMeshAt(s, s.mesh); s.mesh.traverse(o => { if (o.isMesh && !(o.material && o.material.transparent)) o.castShadow = true; }); standLayout(s);
   B.set(s.id, s); stands.push(s); markOcc(s, s.id); invalidateFlows(); return s;
 }
-function rebuildStandMesh(s) { parkGroup.remove(s.mesh); s.mesh = buildStandMesh(s); placeMeshAt(s, s.mesh); }
+function rebuildStandMesh(s) { parkGroup.remove(s.mesh); s.mesh = buildStandMesh(s); placeMeshAt(s, s.mesh); s.mesh.traverse(o => { if (o.isMesh && !(o.material && o.material.transparent)) o.castShadow = true; }); }
 function makeFac(type, gx, gz, rot, saved) {
   const def = FAC_DEFS[type]; const { W, H } = footprint(def, rot);
   const f = Object.assign({ id: saved ? saved.id : newId(), kind: def.kind, type, def, gx, gz, rot, W, H, clean: 100, built: GS.day }, saved || {});
   f.def = def; f.W = W; f.H = H; f.kind = def.kind;
   if (def.kind === 'facility') { f.ent = entranceOf(gx, gz, W, H, rot); f.front = frontDir(rot); f.users = []; f.queue = []; if (inGrid(f.ent.gx, f.ent.gz) && !tiles[ti(f.ent.gx, f.ent.gz)]) tiles[ti(f.ent.gx, f.ent.gz)] = 1; }
-  f.mesh = buildFacMesh(type); placeMeshAt(f, f.mesh); f.mesh.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  f.mesh = buildFacMesh(type); placeMeshAt(f, f.mesh); if (f.ent) f.doorPt = l2w(f, 0, 1.6); f.mesh.traverse(o => { if (o.isMesh) o.castShadow = true; });
   B.set(f.id, f); (def.kind === 'facility' ? facs : scen).push(f); markOcc(f, f.id); invalidateFlows(); recalcAmbience(); return f;
 }
 function removeBuilding(b, refund) {
@@ -1529,19 +1830,30 @@ function removeBuilding(b, refund) {
 
 // ===================== PEOPLE & VEHICLES =====================
 let guests = [], households = [], cars = [], staff = [], vehicles = [];
-let gBody, gHead, carBody, carCab, selRing;
+let GP = {}, carBody, carCab, carWheel, selRing;
 const freeG = [], freeC = [];
 const _d = new THREE.Object3D(), _c = new THREE.Color();
-
+// dummy skeleton used to compute instanced limb matrices
+const GD = {}, CD = {};
+function dchild(parent, x, y, z) { const o = new THREE.Object3D(); o.position.set(x, y, z); parent.add(o); return o; }
 function initAgentMeshes() {
-  gBody = IM(cyl(0.3, 0.36, 1.05, 6), new THREE.MeshLambertMaterial({ color: '#ffffff' }), MAX_GUESTS);
-  gHead = IM(sph(0.24, 6), new THREE.MeshLambertMaterial({ color: '#ffffff' }), MAX_GUESTS);
-  for (let i = 0; i < MAX_GUESTS; i++) { hideInst(gBody, i); hideInst(gHead, i); gBody.setColorAt(i, _c.set('#ffffff')); gHead.setColorAt(i, _c.set('#f1c7a3')); freeG.push(MAX_GUESTS - 1 - i); }
-  scene.add(gBody); scene.add(gHead);
-  carBody = IM(box(2.1, 1.0, 4.4), new THREE.MeshLambertMaterial({ color: '#ffffff' }), MAX_CARS);
-  carCab = IM(box(1.9, 0.8, 2.3), new THREE.MeshLambertMaterial({ color: '#ffffff' }), MAX_CARS);
-  for (let i = 0; i < MAX_CARS; i++) { hideInst(carBody, i); hideInst(carCab, i); carBody.setColorAt(i, _c.set('#ffffff')); carCab.setColorAt(i, _c.set('#223344')); freeC.push(MAX_CARS - 1 - i); }
-  scene.add(carBody); scene.add(carCab);
+  GD.root = new THREE.Object3D(); GD.root.rotation.order = 'YXZ';
+  GD.torso = dchild(GD.root, 0, 1.12, 0); GD.head = dchild(GD.root, 0, 1.62, 0); GD.hair = dchild(GD.root, 0, 1.68, -0.02); GD.hair.scale.set(1, 0.72, 1);
+  GD.pl = dchild(GD.root, -0.12, 0.82, 0); GD.ml = dchild(GD.pl, 0, -0.41, 0); GD.pr = dchild(GD.root, 0.12, 0.82, 0); GD.mr = dchild(GD.pr, 0, -0.41, 0);
+  GD.al = dchild(GD.root, -0.3, 1.38, 0); GD.mal = dchild(GD.al, 0, -0.27, 0); GD.ar = dchild(GD.root, 0.3, 1.38, 0); GD.mar = dchild(GD.ar, 0, -0.27, 0);
+  const sm = () => new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.75 });
+  GP.torso = IM(box(0.46, 0.6, 0.28), sm(), MAX_GUESTS); GP.legL = IM(box(0.17, 0.82, 0.19), sm(), MAX_GUESTS); GP.legR = IM(box(0.17, 0.82, 0.19), sm(), MAX_GUESTS);
+  GP.armL = IM(box(0.12, 0.54, 0.14), sm(), MAX_GUESTS); GP.armR = IM(box(0.12, 0.54, 0.14), sm(), MAX_GUESTS); GP.head = IM(sph(0.2, 10), sm(), MAX_GUESTS); GP.hair = IM(sph(0.205, 10), sm(), MAX_GUESTS);
+  GP.torso.castShadow = true;
+  for (const k in GP) { const im = GP[k]; for (let i = 0; i < MAX_GUESTS; i++) { hideInst(im, i); im.setColorAt(i, _c.set('#ffffff')); } scene.add(im); }
+  for (let i = 0; i < MAX_GUESTS; i++) freeG.push(MAX_GUESTS - 1 - i);
+  CD.root = new THREE.Object3D(); CD.body = dchild(CD.root, 0, 0.6, 0); CD.cab = dchild(CD.root, 0, 1.25, -0.25); CD.w = [[-1, -1.45], [1, -1.45], [-1, 1.45], [1, 1.45]].map(([x, z]) => { const o = dchild(CD.root, x, 0.38, z); o.rotation.z = Math.PI / 2; return o; });
+  carBody = IM(box(2.1, 0.8, 4.4), new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.35, metalness: 0.4 }), MAX_CARS);
+  carCab = IM(box(1.85, 0.7, 2.3), new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.1, metalness: 0.5 }), MAX_CARS);
+  carWheel = IM(cyl(0.38, 0.38, 0.3, 10), new THREE.MeshStandardMaterial({ color: '#1a1a1a', roughness: 0.8 }), MAX_CARS * 4);
+  for (let i = 0; i < MAX_CARS; i++) { hideInst(carBody, i); hideInst(carCab, i); carBody.setColorAt(i, _c.set('#ffffff')); carCab.setColorAt(i, _c.set('#2a3a4c')); freeC.push(MAX_CARS - 1 - i); }
+  for (let i = 0; i < MAX_CARS * 4; i++) hideInst(carWheel, i);
+  carBody.castShadow = true; scene.add(carBody); scene.add(carCab); scene.add(carWheel);
   selRing = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.12, 6, 20), new THREE.MeshBasicMaterial({ color: '#ffcc33' })); selRing.rotation.x = Math.PI / 2; selRing.visible = false; scene.add(selRing);
 }
 function hideInst(im, i) { _d.position.set(0, -50, 0); _d.scale.set(0.001, 0.001, 0.001); _d.rotation.set(0, 0, 0); _d.updateMatrix(); im.setMatrixAt(i, _d.matrix); }
@@ -1589,7 +1901,7 @@ function makeGuest(type, last, hh) {
     pref: T.pref, nauTol: T.nauTol, state: 'incar', x: 0, z: 0, gx: -1, gz: -1, px: 0, pz: 0, ox: 0, oz: 0, heading: 0,
     target: null, ridden: {}, thoughts: [], hidden: true, inst: -1, timer: 0, qT: 0, spent: 0, rides: 0, trash: 0, poisonT: 0, bored: 0,
     trouble: null, critic: false, influencer: type === 'influencer', lastThink: 0, wantLeave: false, outPts: null, arrivedAt: 0,
-    shirt: pick(SHIRTS), skin: pick(SKINS), scale: type === 'kid' ? 0.68 : type === 'grand' ? 0.95 : type === 'teen' ? 0.9 : 1,
+    shirt: pick(SHIRTS), skin: pick(SKINS), pants: pick(PANTS), hair: type === 'grand' ? pick(['#d8d0c0', '#bbbbbb', '#eeeeee']) : pick(HAIRS), scale: type === 'kid' ? 0.68 : type === 'grand' ? 0.95 : type === 'teen' ? 0.9 : 1,
   };
   if ((type === 'teen' || type === 'adult' || type === 'thrill') && chance(0.035 + (GS.rep < 40 ? 0.03 : 0))) g.trouble = pick(['pickpocket', 'vandal', 'fighter', 'cutter', 'cutter']);
   guests.push(g); return g;
@@ -1597,47 +1909,62 @@ function makeGuest(type, last, hh) {
 function guestShow(g) {
   if (g.inst >= 0) return; if (!freeG.length) return;
   g.inst = freeG.pop(); g.hidden = false;
-  gBody.setColorAt(g.inst, _c.set(g.trouble && GS.debugTrouble ? '#000' : g.shirt)); gHead.setColorAt(g.inst, _c.set(g.skin));
-  if (gBody.instanceColor) gBody.instanceColor.needsUpdate = true; if (gHead.instanceColor) gHead.instanceColor.needsUpdate = true;
+  const i = g.inst;
+  GP.torso.setColorAt(i, _c.set(g.shirt)); GP.armL.setColorAt(i, _c); GP.armR.setColorAt(i, _c);
+  GP.legL.setColorAt(i, _c.set(g.pants)); GP.legR.setColorAt(i, _c);
+  GP.head.setColorAt(i, _c.set(g.skin)); GP.hair.setColorAt(i, _c.set(g.hair));
+  for (const k in GP) if (GP[k].instanceColor) GP[k].instanceColor.needsUpdate = true;
 }
+function hideGuestInst(i) { for (const k in GP) hideInst(GP[k], i); }
 function guestRemove(g) {
-  if (g.inst >= 0) { hideInst(gBody, g.inst); hideInst(gHead, g.inst); freeG.push(g.inst); g.inst = -1; }
+  if (g.inst >= 0) { hideGuestInst(g.inst); freeG.push(g.inst); g.inst = -1; }
   g.state = 'gone';
   if (g.target && g.target.queue) g.target.queue = g.target.queue.filter(x => x !== g);
   if (GS.sel === g) GS.sel = null;
+}
+function setGuestMats(i) {
+  GP.torso.setMatrixAt(i, GD.torso.matrixWorld); GP.head.setMatrixAt(i, GD.head.matrixWorld); GP.hair.setMatrixAt(i, GD.hair.matrixWorld);
+  GP.legL.setMatrixAt(i, GD.ml.matrixWorld); GP.legR.setMatrixAt(i, GD.mr.matrixWorld); GP.armL.setMatrixAt(i, GD.mal.matrixWorld); GP.armR.setMatrixAt(i, GD.mar.matrixWorld);
 }
 function renderPeople() {
   const t = performance.now() / 1000;
   for (const g of guests) {
     if (g.inst < 0) continue;
-    if (g.hidden || g.state === 'gone') { hideInst(gBody, g.inst); hideInst(gHead, g.inst); continue; }
-    const moving = g.moving ? Math.abs(Math.sin(t * 9 + g.id)) * 0.12 : 0;
-    let lie = g.state === 'injured';
-    const shake = g.state === 'fight' ? Math.sin(t * 25 + g.id) * 0.25 : 0;
-    const s = g.scale;
-    _d.position.set(g.x + shake, (lie ? 0.35 : 0.52 * s + 0.15) + moving, g.z); _d.rotation.set(lie ? Math.PI / 2 : 0, g.heading, 0); _d.scale.set(s, s, s); _d.updateMatrix(); gBody.setMatrixAt(g.inst, _d.matrix);
-    _d.position.set(g.x + shake + (lie ? Math.sin(g.heading) * 0.75 : 0), lie ? 0.35 : (1.25 * s + 0.15 + moving), g.z + (lie ? Math.cos(g.heading) * 0.75 : 0)); _d.rotation.set(0, 0, 0); _d.updateMatrix(); gHead.setMatrixAt(g.inst, _d.matrix);
+    if (g.hidden || g.state === 'gone') { hideGuestInst(g.inst); continue; }
+    const R = GD.root, s = g.scale, lie = g.state === 'injured', fight = g.state === 'fight';
+    const sw = g.moving ? Math.sin(t * 9 + g.id) : 0;
+    R.position.set(g.x + (fight ? Math.sin(t * 20 + g.id) * 0.1 : 0), lie ? 0.32 : 0.12 + Math.abs(sw) * 0.05 * s, g.z);
+    R.rotation.set(lie ? -Math.PI / 2 : 0, g.heading, 0); R.scale.set(s, s, s);
+    GD.pl.rotation.x = sw * 0.6; GD.pr.rotation.x = -sw * 0.6;
+    if (fight) { const f = Math.sin(t * 14 + g.id); GD.al.rotation.set(-1.6 + f * 0.5, 0, 0); GD.ar.rotation.set(-1.6 - f * 0.5, 0, 0); }
+    else if (g.state === 'queue' && g.qT > 40) { GD.al.rotation.set(0, 0, 0.5); GD.ar.rotation.set(0, 0, -0.5); }
+    else { GD.al.rotation.set(-sw * 0.5, 0, 0.08); GD.ar.rotation.set(sw * 0.5, 0, -0.08); }
+    R.updateMatrixWorld(true); setGuestMats(g.inst);
   }
-  gBody.instanceMatrix.needsUpdate = true; gHead.instanceMatrix.needsUpdate = true;
+  for (const k in GP) GP[k].instanceMatrix.needsUpdate = true;
   for (const c of cars) {
     if (c.state === 'done') continue;
-    const sc = c.bus ? 2.2 : 1;
-    _d.position.set(c.x, 0.65, c.z); _d.rotation.set(0, c.heading, 0); _d.scale.set(c.bus ? 1.15 : 1, c.bus ? 1.6 : 1, sc); _d.updateMatrix(); carBody.setMatrixAt(c.ci, _d.matrix);
-    _d.position.set(c.x, c.bus ? 1.9 : 1.5, c.z); _d.scale.set(c.bus ? 1.1 : 1, c.bus ? 0.5 : 1, c.bus ? 2.0 : 1); _d.updateMatrix(); carCab.setMatrixAt(c.ci, _d.matrix);
+    const R = CD.root; R.position.set(c.x, 0, c.z); R.rotation.set(0, c.heading, 0);
+    R.scale.set(c.bus ? 1.15 : 1, c.bus ? 1.5 : 1, c.bus ? 2.2 : 1);
+    R.updateMatrixWorld(true);
+    carBody.setMatrixAt(c.ci, CD.body.matrixWorld); carCab.setMatrixAt(c.ci, CD.cab.matrixWorld);
+    for (let k = 0; k < 4; k++) carWheel.setMatrixAt(c.ci * 4 + k, CD.w[k].matrixWorld);
   }
-  carBody.instanceMatrix.needsUpdate = true; carCab.instanceMatrix.needsUpdate = true;
+  carBody.instanceMatrix.needsUpdate = true; carCab.instanceMatrix.needsUpdate = true; carWheel.instanceMatrix.needsUpdate = true;
   for (const s of staff) {
     if (!s.mesh) continue;
-    s.mesh.visible = !s.hidden; s.mesh.position.set(s.x, (s.moving ? Math.abs(Math.sin(t * 9 + s.id)) * 0.12 : 0), s.z); s.mesh.rotation.y = s.heading;
+    s.mesh.visible = !s.hidden; if (s.hidden) { if (s.cart) s.cart.visible = false; continue; }
+    s.mesh.position.set(s.x, (s.y || 0) + 0.12, s.z); s.mesh.rotation.y = s.heading;
+    animateFigure(s.fig, s.anim || (s.moving ? 'walk' : 'idle'), t, s.id);
+    if (s.cart) { s.cart.visible = true; if (s.cartAt) { s.cart.position.set(s.cartAt.x, 0, s.cartAt.z); s.cart.rotation.y = s.cartAt.h; } else { s.cart.position.set(s.x + Math.sin(s.heading) * 1.3, 0, s.z + Math.cos(s.heading) * 1.3); s.cart.rotation.y = s.heading; } }
   }
   for (const v of vehicles) {
     v.mesh.position.set(v.x, 0, v.z); v.mesh.rotation.y = v.heading;
     if (v.lights) { const on = Math.floor(t * 6) % 2 === 0; v.lights[0].material = on ? LIGHT_RED : LIGHT_OFF; v.lights[1].material = on ? LIGHT_OFF : (v.kind === 'fire' ? LIGHT_RED : LIGHT_BLUE); }
     if (v.ladder) v.ladder.rotation.x = lerp(v.ladder.rotation.x, v.ladderUp ? -1.0 : 0, 0.05);
   }
-  // selection ring
   const sel = GS.sel;
-  if (sel && (sel.x !== undefined) && !(sel.hidden) && sel.state !== 'gone') { selRing.visible = true; selRing.position.set(sel.x, 0.25, sel.z); }
+  if (sel && (sel.x !== undefined) && !(sel.hidden) && sel.state !== 'gone') { selRing.visible = true; selRing.position.set(sel.x, (sel.y || 0) + 0.25, sel.z); }
   else selRing.visible = false;
 }
 
@@ -1683,14 +2010,6 @@ function wanderStep(a) { // pick random neighbor path tile
 
 // ---------- staff ----------
 const LIGHT_RED = new THREE.MeshBasicMaterial({ color: '#ff2a3a' }), LIGHT_BLUE = new THREE.MeshBasicMaterial({ color: '#2a7bff' }), LIGHT_OFF = new THREE.MeshBasicMaterial({ color: '#333333' });
-function staffMesh(role) {
-  const R = STAFF_ROLES[role], g = new THREE.Group();
-  g.add(mesh(cyl(0.32, 0.38, 1.1, 6), R.color, 0, 0.7, 0)); g.add(mesh(sph(0.25, 6), pick(SKINS), 0, 1.45, 0));
-  g.add(mesh(box(0.55, 0.16, 0.55), role === 'security' ? '#111' : role === 'parking' ? '#ff9a3c' : R.color, 0, 1.68, 0));
-  if (role === 'parking' || role === 'maintenance') g.add(mesh(box(0.7, 0.5, 0.42), '#ffe14a', 0, 0.95, 0));
-  if (role.includes('manager') || role === 'trainer' || role === 'planner') g.add(mesh(box(0.35, 0.45, 0.06), '#ffffff', 0.25, 0.9, 0.3));
-  g.scale.set(1.05, 1.05, 1.05); scene.add(g); return g;
-}
 function hireStaff(role, saved) {
   const R = STAFF_ROLES[role];
   const s = Object.assign({
@@ -1698,7 +2017,8 @@ function hireStaff(role, saved) {
     fatigue: 0, morale: 0.75, wage: R.wage, assign: null, hired: GS.day, stats: { done: 0 },
   }, saved || {});
   s.x = gateX(); s.z = tcz(GATE_GZ) - 2; s.gx = GATE_GX; s.gz = GATE_GZ; s.isStaff = true; s.task = null; s.state = 'idle'; s.timer = 0; s.hidden = false; s.heading = Math.PI;
-  s.mesh = staffMesh(role);
+  s.fig = makeStaffFigure(role); s.mesh = s.fig.root; s.mode = 'grid'; s.y = 0;
+  if (role === 'supplier') s.cart = makeCart();
   staff.push(s);
   if (!saved) {
     if (role === 'operator') { const r = rides.find(r => !staff.some(o => o.role === 'operator' && o.assign === r.id)); if (r) s.assign = r.id; }
@@ -1706,7 +2026,7 @@ function hireStaff(role, saved) {
   }
   return s;
 }
-function fireStaff(s) { scene.remove(s.mesh); staff = staff.filter(x => x !== s); for (const r of rides) if (r.operator === s) r.operator = null; for (const st of stands) if (st.cashier === s) st.cashier = null; if (GS.sel === s) GS.sel = null; }
+function fireStaff(s) { scene.remove(s.mesh); if (s.cart) scene.remove(s.cart); releaseSeat(s); staff = staff.filter(x => x !== s); for (const r of rides) if (r.operator === s) r.operator = null; for (const st of stands) if (st.cashier === s) st.cashier = null; if (GS.sel === s) GS.sel = null; }
 const tr = s => s.train; // training level 0..1
 function perf(s) { return clamp((0.35 + s.skill * 0.35 + s.train * 0.5) * (1 - Math.max(0, s.fatigue - 0.6)) * (0.8 + s.morale * 0.3), 0.15, 1.2); }
 
@@ -1825,7 +2145,7 @@ function updateCars(dt) {
       for (const g of c.hh.members) { think(g, 'lotFull'); g.state = 'gone'; }
       GS.rep = Math.max(0, GS.rep - 0.3); news('Drivers turned away at ' + GS.name + ': parking lot full.');
     } else {
-      if (!sp.bus) sp.taken = true; c.spot = sp; c.state = 'parking'; c.seg = 0;
+      if (!sp.bus) sp.taken = true; c.spot = sp; c.state = 'parking'; c.seg = 0; GS.lotWave = GS.minute;
       const az = aisleZ(sp.z); c.pts = [{ x: gx + 2.4, z: 184 }, { x: gx + 2.4, z: az }, { x: sp.x, z: az }, { x: sp.x, z: sp.z }];
       // fender benders
       const p = dir ? 0.004 * (1 - dir.train) : 0.014;
@@ -1851,7 +2171,7 @@ function departCar(c) {
   c.pts = [{ x: c.spot.x, z: az }, { x: gx - 2.4, z: az }, { x: gx - 2.4, z: 186 }].concat(routePts(world.L, hh.house.node)).concat([{ x: hh.house.x, z: hh.house.z }]);
 }
 function finishCar(c) {
-  c.state = 'done'; hideInst(carBody, c.ci); hideInst(carCab, c.ci); freeC.push(c.ci);
+  c.state = 'done'; hideInst(carBody, c.ci); hideInst(carCab, c.ci); for (let k = 0; k < 4; k++) hideInst(carWheel, c.ci * 4 + k); freeC.push(c.ci);
   for (const g of c.hh.members) { if (g.state !== 'gone' && g.state !== 'atcar') continue; guestRemove(g); }
   for (const g of c.hh.members) if (g.state === 'gone') guestRemove(g);
 }
@@ -1884,7 +2204,7 @@ function updateGate(dt) {
   if (parkOpenNow()) for (const w of workers) {
     w.gateT = (w.gateT || 0) - dt;
     if (w.gateT <= 0 && gateQ.length) {
-      const g = gateQ.shift(); w.gateT = 2.2 / perf(w);
+      const g = gateQ.shift(); w.gateT = 2.2 / perf(w); w.talkT = 1.5;
       admitGuest(g, w);
     }
   }
@@ -2067,7 +2387,7 @@ function arriveAt(g, t) {
 
 // ===================== RIDES =====================
 function rideOperator(r) {
-  const op = staff.find(s => s.role === 'operator' && s.assign === r.id && s.state === 'post');
+  const op = staff.find(s => s.role === 'operator' && s.assign === r.id && (s.state === 'post' || s.state === 'check'));
   if (op) return op;
   const cover = staff.find(s => s.role === 'opmanager' && s.cover === r.id && s.state === 'post');
   return cover || null;
@@ -2096,7 +2416,7 @@ function updateRides(dt) {
       if (r.queue.length && op && rideAvail(r) && parkOpenNow()) { r.state = 'loading'; r.timer = 0; r.loadT = 0; }
     } else if (r.state === 'loading') {
       r.timer += dt; r.loadT -= dt;
-      if (!op || !rideAvail(r)) { if (!r.riders.length) r.state = 'idle'; else if (r.timer > 30) unloadAll(r); continue; }
+      if (!op || !rideAvail(r)) { r.check = null; if (!r.riders.length) r.state = 'idle'; else if (r.timer > 30) unloadAll(r); continue; }
       if (r.loadT <= 0 && r.queue.length && r.riders.length < r.def.cap) {
         r.loadT = 0.9 / perf(op) * (r.def.loadMul || 1);
         const g = r.queue.shift();
@@ -2108,7 +2428,11 @@ function updateRides(dt) {
         g.state = 'riding'; g.hidden = true; g.inside = r; r.riders.push(g); g.x = tcx(r.ent.gx); g.z = tcz(r.ent.gz);
       }
       const full = r.riders.length >= r.def.cap;
-      if (r.riders.length && (full || (!r.queue.length && r.timer > 5) || r.timer > 22)) startCycle(r, op);
+      if (r.riders.length && (full || (!r.queue.length && r.timer > 5) || r.timer > 22)) {
+        if (!r.check) { r.check = { miss: chance(missChance(r, op)), t: 0 }; if (r.check.miss || op.role !== 'operator') r.check.done = true; else op.checkWalk = r; }
+        r.check.t += dt;
+        if (r.check.done || r.check.t > 25) { const miss = r.check.miss; r.check = null; if (op.checkWalk === r) op.checkWalk = null; startCycle(r, op, miss); }
+      }
     } else if (r.state === 'running') {
       r.timer += dt; const dur = r.def.coaster ? 0 : r.def.cycle * r.cycles;
       r.prog = r.def.coaster ? clamp((r.co.s - r.co.C.stop) / r.co.C.L, 0, 1) : clamp(r.timer / dur, 0, 1);
@@ -2119,7 +2443,8 @@ function updateRides(dt) {
     }
   }
 }
-function startCycle(r, op) {
+function missChance(r, op) { const mgr = hasRole('opmanager'); return (0.03 * (1 - op.train) * (1 - op.skill * 0.4) + 0.0012) * (1 + op.fatigue) * (mgr ? 0.5 : 1) * (r.def.sensorMul || 1); }
+function startCycle(r, op, miss) {
   r.state = 'running'; r.timer = 0; r.prog = 0; r.stats.cycles++;
   if (r.type === 'droptower') r.dropHold = 0.08 + Math.random() * 0.2;
   if (r.def.coaster) { r.co.s = r.co.C.stop; r.co.v = 0; r.co.done = false; r.co.valleyT = 0; r.co.valley = r.condition < 40 && (GS.weather === 'rain' || GS.weather === 'cloudy' || isNight()) && chance(0.08); }
@@ -2131,9 +2456,8 @@ function startCycle(r, op) {
   // ---- layered safety check ----
   const mgr = hasRole('opmanager');
   const fatigue = op ? op.fatigue : 0.5, train = op ? op.train : 0;
-  const pMiss = (0.03 * (1 - train) * (1 - op.skill * 0.4) + 0.0012) * (1 + fatigue) * (mgr ? 0.5 : 1) * (r.def.sensorMul || 1);
   const factors = () => ({ op: op ? op.name : 'none', opTrain: train, opFatigue: fatigue, mgr, mxm, speed: sp, cond: r.condition, defect: r.defect, lastInspect: r.lastInspect, mechTrain: avgTrain('maintenance'), mechs: staff.filter(s => s.role === 'maintenance').length, weather: GS.weather });
-  if (chance(pMiss)) {
+  if (miss) {
     if (chance(sensorReliability(r))) { GS.safety.nearMiss++; r.timer -= 3; if (mgr && chance(0.6)) logSafety('Near miss on ' + r.name + ': a restraint was not locked. The sensor caught it and the operator manager re-checked the row.'); else logSafety('Near miss on ' + r.name + ': unlocked restraint caught by the sensor.'); }
     else r.pendingInjury = { at: 0.3 + Math.random() * 0.5, sev: r.def.int > 5 ? 'serious' : 'minor', cause: 'restraint', f: Object.assign(factors(), { sensorFailed: true, restraint: true }) };
   }
@@ -2384,97 +2708,148 @@ function updateFire(s, dt) {
 }
 
 // ===================== STAFF AI =====================
-function postPos(s) {
-  if (s.role === 'operator' || s.role === 'cashier') {
-    const b = B.get(s.assign); if (!b) return null;
-    const e = b.ent, side = [-b.front[1], b.front[0]];
-    return { gx: e.gx, gz: e.gz, x: tcx(e.gx) - b.front[0] * 1.5 + side[0] * 1.6, z: tcz(e.gz) - b.front[1] * 1.5 + side[1] * 1.6 };
+const SPD = 3.4, RUN = 6.2;
+function claimSeat(list, s) { const f = list.find(x => !x.taken) || list[0]; if (f) f.taken = s; return f; }
+function releaseSeat(s) { if (s.seat) { if (s.seat.taken === s) s.seat.taken = null; s.seat = null; } }
+// navigate: leave current off-grid spot, walk the path grid to (tgx,tgz), then follow world points `pts`. returns true when there.
+function navTo(s, key, tgx, tgz, pts, dt, sp) {
+  sp = sp || SPD;
+  if (s.navKey !== key) { s.navKey = key; s.navPhase = s.mode === 'off' ? 'leave' : 'grid'; s.y = 0; }
+  if (s.navPhase === 'leave') {
+    if (s.back && s.back.length) { const p = s.back[0]; if (moveToward(s, p.x, p.z, sp, dt)) s.back.shift(); s.moving = true; return false; }
+    s.back = null; s.mode = 'grid'; s.stepT = false; s.navPhase = 'grid';
   }
-  if (s.role === 'gate') { const i = staff.filter(o => o.role === 'gate').indexOf(s) % 3; return { outside: true, x: gateX() + (i - 1) * 5, z: PHALF + 4 }; }
-  if (s.role === 'parking') return { outside: true, x: gateX() + 6, z: 182 };
-  return null;
+  if (s.navPhase === 'grid') {
+    if (s.stepT) { if (moveToward(s, s.px, s.pz, sp, dt)) { s.stepT = false; s.gx = s.ngx; s.gz = s.ngz; } s.moving = true; return false; }
+    if (!walkable(ti(s.gx, s.gz))) rescueToPath(s);
+    if (s.gx !== tgx || s.gz !== tgz) {
+      if (!stepToward(s, tgx, tgz)) { s.stuckT = (s.stuckT || 0) + dt; s.moving = false; if (s.stuckT > 4) { s.stuckT = 0; s.gx = tgx; s.gz = tgz; s.x = tcx(tgx); s.z = tcz(tgz); } return false; }
+      s.stuckT = 0; return false;
+    }
+    if (!pts || !pts.length) { s.moving = false; s.navPhase = 'done'; return true; }
+    s.route = pts.slice(); s.back = pts.slice(0, -1).reverse().concat([{ x: tcx(tgx), z: tcz(tgz) }]); s.mode = 'off'; s.navPhase = 'out';
+  }
+  if (s.navPhase === 'out') {
+    if (s.route.length) { const p = s.route[0]; if (moveToward(s, p.x, p.z, sp, dt)) s.route.shift(); s.moving = true; return false; }
+    s.navPhase = 'done';
+  }
+  s.moving = false; return true;
 }
-function staffWalkTo(s, gx, gz, dt) {
-  const sp = 3.6;
-  if (s.outsideNow) { // come back inside through gate
-    if (moveToward(s, tcx(GATE_GX), tcz(GATE_GZ), sp, dt)) { s.outsideNow = false; s.gx = GATE_GX; s.gz = GATE_GZ; } s.moving = true; return false;
-  }
-  if (s.stepT) { if (moveToward(s, s.px, s.pz, sp, dt)) { s.stepT = false; s.gx = s.ngx; s.gz = s.ngz; } s.moving = true; return false; }
+function idleWander(s, dt) {
+  if (s.mode === 'off' || s.navKey !== 'wander') { if (!navTo(s, 'wander', s.gx, s.gz, null, dt)) return; }
+  s.anim = null; wanderStaff(s, dt);
+}
+function wanderStaff(s, dt) {
+  if (s.stepT) { if (moveToward(s, s.px, s.pz, 2.6, dt)) { s.stepT = false; s.gx = s.ngx; s.gz = s.ngz; } s.moving = true; return; }
   if (!walkable(ti(s.gx, s.gz))) rescueToPath(s);
-  if (s.gx === gx && s.gz === gz) { s.moving = false; return true; }
-  if (!stepToward(s, gx, gz)) { s.moving = false; s.stuckT = (s.stuckT || 0) + dt; return s.stuckT > 3 ? 'stuck' : false; }
-  s.stuckT = 0; return false;
+  s.wT = (s.wT || 0) - dt; if (s.wT > 0) { s.moving = false; return; }
+  if (!wanderStep(s)) s.wT = 2; else if (chance(0.1)) s.wT = 2 + Math.random() * 4;
 }
+function gatePost(s) { const i = staff.filter(o => o.role === 'gate').indexOf(s) % 3, bx = gateX() + (i - 1) * 5; return { x: bx, z: PHALF + 3.7, h: 0, route: [{ x: tcx(GATE_GX), z: PHALF + 1.2 }, { x: bx, z: PHALF + 1.6 }, { x: bx, z: PHALF + 3.7 }] }; }
+function parkPost() { const gx = gateX(); return { x: gx + 6.5, z: 181, h: 0, route: [{ x: tcx(GATE_GX) + 2, z: PHALF + 1.5 }, { x: gx + 3.5, z: 102 }, { x: gx + 3.5, z: 178 }, { x: gx + 6.5, z: 181 }] }; }
+function atPost(s, post, anim, dt) { s.state = 'post'; s.x = lerp(s.x, post.x, Math.min(1, dt * 5)); s.z = lerp(s.z, post.z, Math.min(1, dt * 5)); s.y = post.y || 0; s.heading = post.h; s.moving = false; s.anim = anim; }
 function updateStaff(dt) {
   const mgrOp = hasRole('opmanager');
+  const anyTraining = staff.some(o => o.state === 'training');
   for (const s of staff) {
-    s.hidden = false;
-    if (s.state === 'training') { s.hidden = true; s.trainT -= dt; if (s.trainT <= 0) finishTraining(s); continue; }
-    if (s.state === 'break') { s.hidden = true; s.timer -= dt; s.fatigue = Math.max(0, s.fatigue - dt * 0.03); if (s.timer <= 0) { s.state = 'idle'; s.x = tcx(GATE_GX); s.z = tcz(GATE_GZ); s.gx = GATE_GX; s.gz = GATE_GZ; s.outsideNow = false; } continue; }
-    const working = parkOpenNow() || GS.minute > DAY_START;
+    s.hidden = false; s.anim = null;
+    if (s.state === 'training') { trainingAI(s, dt); continue; }
+    if (s.state === 'break') { breakAI(s, dt); continue; }
     s.fatigue = Math.min(1, s.fatigue + dt * 0.0011 * (mgrOp ? 0.7 : 1) * (s.state === 'post' || s.state === 'work' ? 1 : 0.4));
     s.morale = clamp(s.morale + dt * (s.fatigue > 0.85 ? -0.0006 : 0.0002), 0, 1);
-    if (s.fatigue > 0.88 && s.role !== 'opmanager') { takeBreak(s); continue; }
+    if (s.fatigue > 0.88 && s.role !== 'opmanager' && s.state !== 'check' && s.state !== 'work') { takeBreak(s); continue; }
     switch (s.role) {
-      case 'operator': case 'cashier': {
-        const p = postPos(s); if (!p) { wanderStaff(s, dt); break; }
-        if (s.state === 'post') { s.x = lerp(s.x, p.x, Math.min(1, dt * 4)); s.z = lerp(s.z, p.z, Math.min(1, dt * 4)); const b = B.get(s.assign); s.heading = Math.atan2(-b.front[0], -b.front[1]) + Math.PI; s.moving = false; break; }
-        const r = staffWalkTo(s, p.gx, p.gz, dt); if (r === true) s.state = 'post';
+      case 'operator': operatorAI(s, dt); break;
+      case 'cashier': {
+        const st = B.get(s.assign); if (!st) { s.state = 'idle'; idleWander(s, dt); break; }
+        if (s.state === 'post' && s.navKey === 'post' + st.id) { atPost(s, st.post, st.queue.length ? 'talk' : null, dt); break; }
+        s.state = 'idle'; if (navTo(s, 'post' + st.id, st.ent.gx, st.ent.gz, st.post.route, dt)) s.state = 'post';
         break;
       }
-      case 'gate': case 'parking': {
-        const p = postPos(s);
-        if (s.state === 'post') { s.moving = false; s.heading = Math.PI; break; }
-        if (!s.outside) { if (s.gx === GATE_GX && s.gz === GATE_GZ && !s.stepT) { s.outside = true; } else { staffWalkTo(s, GATE_GX, GATE_GZ, dt); break; } }
-        if (moveToward(s, p.x, p.z, 3.6, dt)) s.state = 'post'; s.moving = s.state !== 'post';
-        break;
-      }
+      case 'gate': { const p = gatePost(s); if (s.state === 'post' && s.navKey === 'gate') { atPost(s, p, (s.talkT || 0) > 0 ? 'talk' : null, dt); s.talkT -= dt; break; } s.state = 'idle'; if (navTo(s, 'gate', GATE_GX, GATE_GZ, p.route, dt)) s.state = 'post'; break; }
+      case 'parking': { const p = parkPost(); if (s.state === 'post' && s.navKey === 'park') { atPost(s, p, GS.minute - (GS.lotWave || -99) < 2.5 ? 'wave' : 'stop', dt); break; } s.state = 'idle'; if (navTo(s, 'park', GATE_GX, GATE_GZ, p.route, dt)) s.state = 'post'; break; }
       case 'maintenance': mechAI(s, dt); break;
       case 'janitor': janitorAI(s, dt); break;
       case 'security': securityAI(s, dt); break;
       case 'supplier': supplierAI(s, dt); break;
       case 'opmanager': opManagerAI(s, dt); break;
-      default: plannerAI(s, dt); break; // mxmanager, trainer, planner wander/inspect
+      case 'trainer': if (anyTraining) { s.state = 'work'; if (navTo(s, 'teach', GATE_GX, GATE_GZ, routeToCenter(SC.teach), dt)) { s.heading = SC.teach.h; s.anim = 'point'; } break; } s.state = 'idle'; strollAI(s, dt); break;
+      default: strollAI(s, dt); break;
     }
   }
 }
-function takeBreak(s) {
-  s.state = 'break'; s.timer = 25; s.task = null; s.outside = false; s.stepT = false;
-  if (s.role === 'operator') { const m = staff.find(o => o.role === 'opmanager' && o.state !== 'training' && !o.cover); if (m) { m.cover = s.assign; m.coverT = 25; m.state = 'idle'; } }
+function operatorAI(s, dt) {
+  const r = B.get(s.assign); if (!r) { s.state = 'idle'; idleWander(s, dt); return; }
+  if (s.state === 'check') {
+    s.y = r.post.y;
+    if (s.pauseT > 0) { s.pauseT -= dt; s.anim = 'inspect'; s.moving = false; return; }
+    const p = s.chk[0];
+    if (moveToward(s, p.x, p.z, 2.6, dt)) { s.chk.shift(); if (s.chk.length === 2) s.pauseT = 1.0 / perf(s); }
+    s.moving = true;
+    if (!s.chk.length) { s.state = 'post'; s.checkWalk = null; if (r.check) r.check.done = true; }
+    return;
+  }
+  if (s.state === 'post' && s.navKey === 'post' + r.id) {
+    if (s.checkWalk === r) { s.state = 'check'; s.chk = r.checkPts.slice(); s.pauseT = 0; return; }
+    atPost(s, r.post, 'console', dt); return;
+  }
+  s.state = 'idle'; if (navTo(s, 'post' + r.id, r.ent.gx, r.ent.gz, r.post.route, dt)) s.state = 'post';
 }
-function wanderStaff(s, dt) {
-  if (s.stepT) { if (moveToward(s, s.px, s.pz, 2.8, dt)) { s.stepT = false; s.gx = s.ngx; s.gz = s.ngz; } s.moving = true; return; }
-  if (!walkable(ti(s.gx, s.gz))) rescueToPath(s);
-  s.wT = (s.wT || 0) - dt; if (s.wT > 0) { s.moving = false; return; }
-  if (!wanderStep(s)) s.wT = 2; else if (chance(0.1)) s.wT = 2 + Math.random() * 4;
+function strollAI(s, dt) { // managers / planner: walk ride to ride with a clipboard
+  if (!s.visit || !B.has(s.visit.id)) { if ((s.wanderUntil || 0) > GS.minute || !rides.length) { idleWander(s, dt); if (!s.anim && !s.moving) s.anim = 'clipboard'; return; } s.visit = pick(rides); s.visitT = 6; }
+  const r = s.visit;
+  if (navTo(s, 'visit' + r.id, r.ent.gx, r.ent.gz, [r.gapPt], dt)) { s.anim = 'clipboard'; const c = l2w(r, 0, 0); s.heading = Math.atan2(c.x - s.x, c.z - s.z); s.visitT -= dt; if (s.visitT <= 0) { s.visit = null; s.wanderUntil = GS.minute + 8 + Math.random() * 12; } }
+}
+function takeBreak(s) {
+  if (s.role === 'operator' && s.assign) { const m = staff.find(o => o.role === 'opmanager' && o.state !== 'training' && o.state !== 'break' && !o.cover); if (m) { m.cover = s.assign; m.coverT = 30; m.state = 'idle'; } }
+  if (s.role === 'maintenance') for (const r of rides) if (r.mechanic === s) r.mechanic = null;
+  s.task = null; s.checkWalk = null; s.state = 'break'; s.timer = 25; releaseSeat(s); s.seat = claimSeat(SC_SEATS, s);
+}
+function breakAI(s, dt) {
+  const st = s.seat;
+  if (!navTo(s, 'break', GATE_GX, GATE_GZ, routeToCenter(st), dt)) return;
+  s.heading = st.h; s.anim = 'sit'; s.x = st.x; s.z = st.z;
+  s.timer -= dt; s.fatigue = Math.max(0, s.fatigue - dt * 0.03);
+  if (s.timer <= 0) { releaseSeat(s); s.state = 'idle'; }
+}
+function trainingAI(s, dt) {
+  const st = s.seat;
+  if (!st || !navTo(s, 'train', GATE_GX, GATE_GZ, routeToCenter(st), dt)) return;
+  s.heading = st.h; s.anim = 'sitlisten'; s.x = st.x; s.z = st.z;
+  s.trainT -= dt; if (s.trainT <= 0) finishTraining(s);
 }
 function mechAI(s, dt) {
-  const t = s.task;
+  let t = s.task;
+  if (t && !B.has(t.r.id)) { s.task = t = null; }
   if (!t) {
     const broken = rides.filter(r => r.broken && (!r.mechanic || !staff.includes(r.mechanic)));
-    if (broken.length) { const r = broken[0]; r.mechanic = s; s.task = { type: 'repair', r }; return; }
-    if (GS.minute > DAY_START) {
+    if (broken.length) { const r = broken[0]; r.mechanic = s; s.task = { type: 'repair', r }; }
+    else if (GS.minute > DAY_START) {
       const mxm = hasRole('mxmanager');
       const due = rides.filter(r => r.lastInspect < GS.day && !staff.some(o => o.task && o.task.r === r));
       if (mxm) due.sort((a, b) => (a.condition - b.condition) + (b.def.tall ? 10 : 0) - (a.def.tall ? 10 : 0));
-      if (due.length) { s.task = { type: 'inspect', r: due[0] }; return; }
       const worn = rides.filter(r => r.condition < (mxm ? 70 : 50) && !staff.some(o => o.task && o.task.r === r));
-      if (worn.length) { s.task = { type: 'inspect', r: worn[0] }; return; }
+      const pickR = due[0] || worn[0];
+      if (pickR) s.task = { type: 'inspect', r: pickR, phase: 0 };
     }
-    wanderStaff(s, dt); s.state = 'idle'; return;
+    t = s.task;
+    if (!t) { s.state = 'idle'; idleWander(s, dt); return; }
   }
-  const r = t.r; if (!B.has(r.id)) { s.task = null; return; }
-  if (s.state !== 'work') {
-    const res = staffWalkTo(s, r.ent.gx, r.ent.gz, dt);
-    if (res === true) { s.state = 'work'; s.timer = (t.type === 'repair' ? 26 : 18) / perf(s) * (r.def.wearMul || 1); }
-    else if (res === 'stuck') { s.task = null; if (t.type === 'repair') r.mechanic = null; }
-    return;
+  const r = t.r;
+  if (t.type === 'repair') {
+    if (!navTo(s, 'repair' + r.id, r.ent.gx, r.ent.gz, [r.gapPt, r.repairPt], dt)) { s.state = 'idle'; return; }
+    if (s.state !== 'work') { s.state = 'work'; s.timer = 26 / perf(s) * (r.def.wearMul || 1); }
+    const c = l2w(r, 0, 0); s.heading = Math.atan2(c.x - s.x, c.z - s.z); s.anim = 'hammer';
+    s.timer -= dt; if (s.timer > 0) return;
+    s.state = 'idle'; s.task = null; s.stats.done++; finishRepair(r, s); return;
   }
-  s.moving = false; s.timer -= dt;
-  if (s.timer > 0) return;
+  // inspection: walk the ride's corners with a clipboard
+  if (!navTo(s, 'insp' + r.id, r.ent.gx, r.ent.gz, [r.gapPt], dt)) { s.state = 'idle'; return; }
+  s.state = 'work';
+  if (!t.pts) { t.pts = r.inspectPts.slice(1); t.pause = 0; }
+  if (t.pause > 0) { t.pause -= dt; s.anim = 'inspect'; const c = l2w(r, 0, 0); s.heading = Math.atan2(c.x - s.x, c.z - s.z); return; }
+  if (t.pts.length) { const p = t.pts[0]; if (moveToward(s, p.x, p.z, 2.4, dt)) { t.pts.shift(); t.pause = 3.2 / perf(s) * (r.def.wearMul || 1); } s.moving = true; return; }
   s.state = 'idle'; s.task = null; s.stats.done++;
-  if (t.type === 'repair') { finishRepair(r, s); return; }
-  // inspection
   const mxm = hasRole('mxmanager');
   r.lastInspect = GS.day; r.condition = Math.min(100, r.condition + 22 * perf(s));
   if (r.defect > 0.05) {
@@ -2487,34 +2862,45 @@ function mechAI(s, dt) {
   r.inspectedCond = Math.round(r.condition);
 }
 function janitorAI(s, dt) {
-  const t = s.task;
+  let t = s.task;
+  if (t && ((t.f && !B.has(t.f.id)) || (t.st && !B.has(t.st.id)))) t = s.task = null;
   if (!t) {
     let best = -1, bs = 0;
     for (let i = 0; i < NN; i++) { const v = litter[i] + vomit[i] * 12; if (v > 0) { const x = i % GRID, z = (i / GRID) | 0; const sc = v * 3 - (Math.abs(x - s.gx) + Math.abs(z - s.gz)) * 0.5; if (sc > bs && !staff.some(o => o.task && o.task.i === i)) { bs = sc; best = i; } } }
     const dirtyRR = facs.find(f => f.type === 'restroom' && f.clean < 55 && !staff.some(o => o.task && o.task.f === f));
-    if (dirtyRR && (best < 0 || dirtyRR.clean < 35)) { s.task = { f: dirtyRR }; return; }
-    if (best >= 0) { s.task = { i: best }; return; }
-    const st = stands.find(x => x.clean < 50 && !staff.some(o => o.task && o.task.st === x)); if (st) { s.task = { st }; return; }
-    wanderStaff(s, dt); s.state = 'idle'; return;
+    if (dirtyRR && (best < 0 || dirtyRR.clean < 35)) s.task = { f: dirtyRR };
+    else if (best >= 0) s.task = { i: best };
+    else { const st = stands.find(x => x.clean < 50 && !staff.some(o => o.task && o.task.st === x)); if (st) s.task = { st }; }
+    t = s.task;
+    if (!t) { s.state = 'idle'; idleWander(s, dt); return; }
   }
-  let gx, gz; if (t.f) { gx = t.f.ent.gx; gz = t.f.ent.gz; } else if (t.st) { gx = t.st.ent.gx; gz = t.st.ent.gz; } else { gx = t.i % GRID; gz = (t.i / GRID) | 0; }
-  if ((t.f && !B.has(t.f.id)) || (t.st && !B.has(t.st.id))) { s.task = null; return; }
-  if (s.state !== 'work') { const r = staffWalkTo(s, gx, gz, dt); if (r === true) { s.state = 'work'; s.timer = (t.f ? 12 : t.st ? 8 : 4 + vomit[t.i] * 5) / perf(s); } else if (r === 'stuck') s.task = null; return; }
-  s.timer -= dt; s.moving = false; if (s.timer > 0) return;
-  if (t.f) t.f.clean = 100; else if (t.st) t.st.clean = 100;
-  else { const hadV = vomit[t.i]; litter[t.i] = 0; vomit[t.i] = 0; GS.litterDirty = true; if (hadV) { wetFloor[t.i] = 30; GS.wetSign[t.i] = s.train > 0.4 || chance(s.train); GS.pathDirty = true; } }
-  s.task = null; s.state = 'idle'; s.stats.done++;
+  let arrived;
+  if (t.f) arrived = navTo(s, 'rr' + t.f.id, t.f.ent.gx, t.f.ent.gz, [t.f.doorPt], dt);
+  else if (t.st) arrived = navTo(s, 'st' + t.st.id, t.st.ent.gx, t.st.ent.gz, [t.st.sidePt], dt);
+  else arrived = navTo(s, 'tile' + t.i, t.i % GRID, (t.i / GRID) | 0, null, dt);
+  if (!arrived) { s.state = 'idle'; return; }
+  if (s.state !== 'work') {
+    s.state = 'work'; s.timer = (t.f ? 12 : t.st ? 8 : 4 + vomit[t.i] * 5) / perf(s);
+    if (t.f && s.train > 0.4) { const ei = ti(t.f.ent.gx, t.f.ent.gz); wetFloor[ei] = Math.max(wetFloor[ei], s.timer + 8); GS.wetSign[ei] = 1; GS.pathDirty = true; }
+  }
+  s.hidden = !!t.f; s.anim = 'sweep';
+  s.timer -= dt; if (s.timer > 0) return;
+  if (t.f) { t.f.clean = 100; if (s.train <= 0.4) { const ei = ti(t.f.ent.gx, t.f.ent.gz); wetFloor[ei] = 20; GS.wetSign[ei] = 0; GS.pathDirty = true; } }
+  else if (t.st) t.st.clean = 100;
+  else { const hadV = vomit[t.i]; litter[t.i] = 0; vomit[t.i] = 0; GS.litterDirty = true; if (hadV) { wetFloor[t.i] = 30; GS.wetSign[t.i] = s.train > 0.4 || chance(s.train) ? 1 : 0; GS.pathDirty = true; } }
+  s.hidden = false; s.task = null; s.state = 'idle'; s.stats.done++;
 }
 function securityAI(s, dt) {
   if (!s.task) { const inc = incidents.find(i => i.sec === 'need' && !i.done && !staff.some(o => o.task && o.task.inc === i)); if (inc) s.task = { type: 'incident', inc }; }
   const t = s.task;
-  if (!t) { wanderStaff(s, dt); s.state = 'idle'; return; }
-  const inc = t.inc; if (inc.done || inc.sec === 'handled') { s.task = null; return; }
-  if (s.state !== 'work') { const r = staffWalkTo(s, inc.gx, inc.gz, dt); if (r === true) { s.state = 'work'; s.timer = 6 / perf(s); } else if (r === 'stuck') s.task = null; return; }
-  s.timer -= dt; s.moving = false; if (s.timer > 0) return;
+  if (!t) { s.state = 'idle'; idleWander(s, dt); return; }
+  const inc = t.inc; if (inc.done || inc.sec === 'handled') { s.task = null; s.state = 'idle'; return; }
+  if (!navTo(s, 'inc' + inc.id, inc.gx, inc.gz, null, dt, RUN)) { s.anim = s.moving ? 'run' : null; s.state = 'idle'; return; }
+  if (s.state !== 'work') { s.state = 'work'; s.timer = 6 / perf(s); }
+  s.anim = 'talk'; const g = inc.guests[0]; if (g) s.heading = Math.atan2(g.x - s.x, g.z - s.z);
+  s.timer -= dt; if (s.timer > 0) return;
   s.state = 'idle'; s.task = null; s.stats.done++;
   const ok = chance(0.35 + 0.6 * perf(s));
-  // overreaction
   if (chance(0.22 * (1 - s.train) * (1 - s.skill * 0.5))) {
     GS.rep = clamp(GS.rep - 3, 0, 100);
     for (const o of guests) if (o.state === 'walk' && Math.abs(o.gx - s.gx) + Math.abs(o.gz - s.gz) < 5 && chance(0.5)) think(o, 'overreact', {}, true);
@@ -2536,40 +2922,42 @@ function escalateFight(inc) {
   GS.rep = clamp(GS.rep - 2, 0, 100); GS.dstats.incidents.push('Major fight');
 }
 function supplierAI(s, dt) {
-  if (!s.task) { const st = stands.find(x => x.menu.some(m => (x.stock[m.key] || 0) < 22) && !staff.some(o => o.task && o.task.st === x)); if (st) s.task = { st }; else { wanderStaff(s, dt); s.state = 'idle'; return; } }
-  const st = s.task.st; if (!B.has(st.id)) { s.task = null; return; }
-  if (s.state !== 'work') { const r = staffWalkTo(s, st.ent.gx, st.ent.gz, dt); if (r === true) { s.state = 'work'; s.timer = 6 / perf(s); } else if (r === 'stuck') s.task = null; return; }
-  s.timer -= dt; s.moving = false; if (s.timer > 0) return;
+  if (s.task && !B.has(s.task.st.id)) s.task = null;
+  if (!s.task) { const st = stands.find(x => x.menu.some(m => (x.stock[m.key] || 0) < 22) && !staff.some(o => o.task && o.task.st === x)); if (st) s.task = { st }; else { s.cartAt = null; s.state = 'idle'; idleWander(s, dt); return; } }
+  const st = s.task.st;
+  if (!navTo(s, 'sup' + st.id, st.ent.gx, st.ent.gz, [st.sidePt], dt)) { s.cartAt = null; s.state = 'idle'; return; }
+  if (s.state !== 'work') { s.state = 'work'; s.timer = 6 / perf(s); s.cartAt = { x: s.x + Math.sin(s.heading) * 1.3, z: s.z + Math.cos(s.heading) * 1.3, h: s.heading }; }
+  s.anim = 'carry';
+  s.timer -= dt; if (s.timer > 0) return;
   for (const m of st.menu) {
-    if (s.train < 0.4 && chance(0.3 * (1 - s.train))) continue; // forgot / wrong item
+    if (s.train < 0.4 && chance(0.3 * (1 - s.train))) continue;
     const need = 60 - (st.stock[m.key] || 0); if (need <= 0) continue;
     st.stock[m.key] = 60; addMoney(-need * FOOD[m.key].cost * QUALITY[m.q].costMul, 'stock');
   }
-  s.task = null; s.state = 'idle'; s.stats.done++;
+  s.task = null; s.state = 'idle'; s.stats.done++; s.cartAt = null;
 }
 function opManagerAI(s, dt) {
   if (s.cover) {
     const r = B.get(s.cover); s.coverT -= dt;
     if (!r || s.coverT <= 0) { s.cover = null; s.state = 'idle'; return; }
-    if (s.state === 'post') { s.moving = false; return; }
-    const res = staffWalkTo(s, r.ent.gx, r.ent.gz, dt); if (res === true) s.state = 'post'; else if (res === 'stuck') s.cover = null; return;
+    if (s.state === 'post' && s.navKey === 'cover' + r.id) { atPost(s, r.post, 'console', dt); return; }
+    s.state = 'idle'; if (navTo(s, 'cover' + r.id, r.ent.gx, r.ent.gz, r.post.route, dt)) s.state = 'post'; return;
   }
-  wanderStaff(s, dt); s.state = 'idle';
+  strollAI(s, dt);
 }
-function plannerAI(s, dt) { wanderStaff(s, dt); s.state = 'idle'; }
 function startTraining(s) {
   const trainer = staff.find(o => o.role === 'trainer' && o.state !== 'training');
   if (!trainer) { toast('Hire a Staff Trainer first.', 'warn'); return false; }
   if (s.state === 'training') return false;
   if (s.train >= 0.98) { toast(s.name + ' is fully trained.', ''); return false; }
-  s.state = 'training'; s.trainT = 40; s.task = null; s.trainer = trainer; s.stepT = false;
   if (s.role === 'maintenance') for (const r of rides) if (r.mechanic === s) r.mechanic = null;
+  releaseSeat(s); s.state = 'training'; s.trainT = 40; s.task = null; s.trainer = trainer; s.checkWalk = null; s.cartAt = null; s.seat = claimSeat(SC_CLASS, s);
   addMoney(-150, 'training'); return true;
 }
 function finishTraining(s) {
   const tq = s.trainer && staff.includes(s.trainer) ? 0.35 + 0.65 * perf(s.trainer) : 0.4;
   s.train = Math.min(1, s.train + (0.22 + 0.4 * tq) * (1 - s.train * 0.35));
-  s.state = 'idle'; s.hidden = false; s.x = tcx(GATE_GX); s.z = tcz(GATE_GZ); s.gx = GATE_GX; s.gz = GATE_GZ; s.outside = false;
+  releaseSeat(s); s.state = 'idle';
   s.morale = Math.min(1, s.morale + 0.1);
   toast(s.name + ' finished training (' + pct(s.train) + ').', 'good');
 }
@@ -2727,7 +3115,8 @@ function endDay() {
   for (const r of rides) { r.queue = []; r.riders = []; r.state = 'idle'; r.stuck = false; if (r.broken && !r.mechanic) { } r.incidentClosed = false; }
   for (const s of stands) s.queue = [];
   for (const f of facs) { f.queue = []; f.users = []; }
-  let wages = 0; for (const s of staff) { wages += s.wage; s.fatigue = 0; s.state = 'idle'; s.task = null; s.cover = null; s.outside = false; s.x = tcx(GATE_GX); s.z = tcz(GATE_GZ); s.gx = GATE_GX; s.gz = GATE_GZ; s.stepT = false; }
+  let wages = 0; for (const s of staff) { wages += s.wage; s.fatigue = 0; if (s.state === 'training') finishTraining(s); releaseSeat(s); s.state = 'idle'; s.task = null; s.cover = null; s.checkWalk = null; s.cartAt = null; s.mode = 'grid'; s.navKey = null; s.route = null; s.back = null; s.y = 0; s.x = tcx(GATE_GX); s.z = tcz(GATE_GZ); s.gx = GATE_GX; s.gz = GATE_GZ; s.stepT = false; s.hidden = false; }
+  for (const r of rides) r.check = null;
   addMoney(-wages, 'wages');
   const ds = GS.dstats, avg = ds.exitHappy.length ? ds.exitHappy.reduce((a, b) => a + b, 0) / ds.exitHappy.length : 60;
   if (ds.guests > 0) GS.rep = clamp(GS.rep + (avg - 60) * 0.12 + (ds.incidents.length ? 0 : 0.5), 0, 100);
@@ -3270,8 +3659,11 @@ function cameraKeys(dt) {
 
 // ===================== LIGHTING & WEATHER FX =====================
 let rain, skyDay, skyNight, skyDusk;
+let SKY = null, envLevel = -1;
 function initFX() {
-  skyDay = new THREE.Color('#9fd3ff'); skyNight = new THREE.Color('#0b1430'); skyDusk = new THREE.Color('#ff9a6a');
+  skyDay = 1;
+  const C = h => new THREE.Color(h);
+  SKY = { day: [C('#3b82d6'), C('#b8dcff'), C('#e4eef8')], dusk: [C('#2c3e7a'), C('#ff9a6a'), C('#ffcfa0')], night: [C('#050a1c'), C('#1a2850'), C('#0e1428')], storm: [C('#4a5260'), C('#8a929e'), C('#9aa2ac')], sunDay: C('#fff1d6'), sunLow: C('#ffb27a'), moon: C('#8fa8ff'), t: [C('#000'), C('#000'), C('#000')] };
   const n = 1500, pos = new Float32Array(n * 3); for (let i = 0; i < n; i++) { pos[i * 3] = (Math.random() - 0.5) * 240; pos[i * 3 + 1] = Math.random() * 90; pos[i * 3 + 2] = (Math.random() - 0.5) * 240; }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   rain = new THREE.Points(g, new THREE.PointsMaterial({ color: '#b8d0ff', size: 0.5, transparent: true, opacity: 0.6 })); rain.visible = false; scene.add(rain);
@@ -3279,21 +3671,26 @@ function initFX() {
 }
 function updateLighting(rdt) {
   const m = GS.minute, dayT = clamp((m - 6 * 60) / (14.5 * 60), 0, 1), up = Math.sin(dayT * Math.PI);
-  const wet = GS.weather === 'rain' || GS.weather === 'storm', cloud = wet ? 0.55 : GS.weather === 'cloudy' ? 0.75 : 1;
-  sun.intensity = (0.08 + 0.8 * up) * cloud; hemi.intensity = 0.22 + 0.45 * up * (0.6 + cloud * 0.4);
-  const ang = dayT * Math.PI; sun.position.set(CAM.tx + Math.cos(ang) * 200, 30 + Math.sin(ang) * 260, CAM.tz + 110); sun.target.position.set(CAM.tx, 0, CAM.tz);
-  const bg = scene.background; bg.copy(skyNight).lerp(skyDay, clamp(up * 1.6, 0, 1));
-  if (up < 0.4 && up > 0.02) bg.lerp(skyDusk, (0.4 - up) * 1.2 * (m > 12 * 60 ? 1 : 0.6));
-  if (wet) bg.lerp(new THREE.Color('#5a6270'), 0.5);
-  scene.fog.color.copy(bg); scene.fog.near = CAM.dist + 350; scene.fog.far = CAM.dist * 1.6 + 1500;
-  BULB_MAT.emissiveIntensity = up < 0.3 ? 1.5 : 0.2;
-  if (GS.flash > 0) { ambient.intensity = 0.15 + GS.flash * 1.6; GS.flash = Math.max(0, GS.flash - rdt * 4); } else ambient.intensity = 0.12 + (1 - up) * 0.12;
+  const wet = GS.weather === 'rain' || GS.weather === 'storm', cloud = wet ? 0.5 : GS.weather === 'cloudy' ? 0.72 : 1;
+  sun.intensity = (0.12 + 1.9 * up) * cloud; hemi.intensity = 0.16 + 0.48 * up;
+  sun.color.copy(up < 0.08 ? SKY.moon : SKY.sunLow).lerp(SKY.sunDay, clamp((up - 0.08) * 3, 0, 1));
+  const ang = dayT * Math.PI; sun.position.set(CAM.tx + Math.cos(ang) * 220, 40 + Math.sin(ang) * 260, CAM.tz + 120); sun.target.position.set(CAM.tx, 0, CAM.tz);
+  // sky gradient: night -> dusk -> day
+  const T = SKY.t, dayK = clamp(up * 1.8, 0, 1), duskK = up > 0.02 && up < 0.45 ? (0.45 - up) / 0.45 * (m > 12 * 60 ? 1 : 0.7) : 0;
+  for (let k = 0; k < 3; k++) { T[k].copy(SKY.night[k]).lerp(SKY.day[k], dayK); if (duskK) T[k].lerp(SKY.dusk[k], duskK * 0.8); if (wet) T[k].lerp(SKY.storm[k], 0.6 * dayK); }
+  skyMat.uniforms.top.value.copy(T[0]); skyMat.uniforms.mid.value.copy(T[1]); skyMat.uniforms.bot.value.copy(T[2]);
+  skyDome.position.copy(camera.position);
+  scene.fog.color.copy(T[1]); scene.fog.near = CAM.dist + 350; scene.fog.far = CAM.dist * 1.6 + 1500;
+  const env = Math.round((0.2 + 0.8 * up * cloud) * 20) / 20;
+  if (env !== envLevel) { envLevel = env; for (const k in MAT) MAT[k].envMapIntensity = env; }
+  BULB_MAT.emissiveIntensity = up < 0.3 ? 2.2 : 0.25;
+  if (GS.flash > 0) { ambient.intensity = 0.1 + GS.flash * 2.2; GS.flash = Math.max(0, GS.flash - rdt * 4); } else ambient.intensity = 0.04 + (1 - up) * 0.08;
   rain.visible = wet && CAM.dist < 600;
   if (rain.visible) { rain.position.set(CAM.tx, 0, CAM.tz); const a = rain.geometry.attributes.position; for (let i = 0; i < a.count; i++) { let y = a.getY(i) - rdt * 70; if (y < 0) y += 90; a.setY(i, y); } a.needsUpdate = true; }
 }
 
 // ===================== MAIN LOOP =====================
-function animateRides(dt) { for (const r of rides) r.mesh.update(dt, r.rf, r.speed, r.prog, r); }
+function animateRides(dt) { for (const r of rides) { r.mesh.update(dt, r.rf, r.speed, r.prog, r); updateSeats(r); } }
 function simStep(dt) {
   GS.minute += dt;
   if (!GS.open && !GS.firstOpenDone && GS.minute > 8.9 * 60) GS.minute = 8.9 * 60; // first day waits for you to open
@@ -3320,7 +3717,7 @@ function frame(now) {
   renderPeople();
   for (const f of scen) if (f.type === 'fountain' && f.mesh.userData.spray) f.mesh.userData.spray.rotation.y += rdt;
   if (GS.litterDirty) { GS.litterDirty = false; refreshLitter(); }
-  if (GS.pathDirty) { GS.pathDirty = false; refreshPaths(); }
+  if (GS.pathDirty) { GS.pathDirty = false; refreshPaths(); refreshWetSigns(); }
   uiT -= rdt; if (uiT <= 0) { uiT = 0.4; updateHUD(); tutorialTick(); UI.insT = (UI.insT || 0) + 1; if (UI.insT % 3 === 0) { renderInspector(false); renderPanel(false); } }
   renderer.render(scene, camera);
 }
@@ -3437,7 +3834,8 @@ document.addEventListener('click', e => { const p = e.target.closest('[data-ptyp
 
 function boot() {
   initRenderer();
-  BULB_MAT = new THREE.MeshLambertMaterial({ color: '#fff3c0', emissive: '#ffb830', emissiveIntensity: 0.2 });
+  BULB_MAT = new THREE.MeshStandardMaterial({ color: '#fff3c0', emissive: '#ffb830', emissiveIntensity: 0.2, roughness: 0.4 });
+  initPropMats();
   wireUI(); wireInput();
   window.addEventListener('beforeunload', () => { if (GS && GS.slot >= 0 && !GS.silent) saveSlot(GS.slot, true); });
   requestAnimationFrame(frame);
